@@ -236,6 +236,22 @@ const commands = [
     .setName("xoatatthongbao")
     .setDescription("Xóa TẤT CẢ thông báo đã gửi")
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("xoatatkey")
+    .setDescription("⚠️ Xóa HÀNG LOẠT key (yêu cầu xác nhận)")
+    .addStringOption(o =>
+      o.setName("loc")
+        .setDescription("Nhóm key cần xóa (mặc định: tất cả)")
+        .setRequired(false)
+        .addChoices(
+          { name: "Tất cả key",         value: "all"     },
+          { name: "Chỉ key FREE",        value: "free"    },
+          { name: "Chỉ key hết hạn",     value: "expired" },
+          { name: "Chỉ key đã khóa",     value: "locked"  },
+        ))
+    .toJSON(),
 ];
 
 async function findKey(keyStr: string) {
@@ -830,6 +846,126 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
         .setDescription(`Đã xóa **${Number(count)}** thông báo.`)
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /xoatatkey ───────────────────────────────────────────────────────────
+    else if (cmd === "xoatatkey") {
+      const filter = interaction.options.getString("loc") ?? "all";
+
+      // Label cho từng loại
+      const filterLabel: Record<string, string> = {
+        all:     "TẤT CẢ key",
+        free:    "tất cả key **FREE**",
+        expired: "tất cả key **đã hết hạn**",
+        locked:  "tất cả key **đã khóa**",
+      };
+
+      // Đếm số key sẽ bị xóa
+      const all = await db.select().from(keysTable);
+      const now = new Date();
+      let targets: typeof all;
+      switch (filter) {
+        case "free":    targets = all.filter(k => k.tier === "free");                                         break;
+        case "expired": targets = all.filter(k => k.isActive && k.expiresAt && k.expiresAt < now);           break;
+        case "locked":  targets = all.filter(k => !k.isActive);                                               break;
+        default:        targets = all;
+      }
+
+      if (targets.length === 0) {
+        await interaction.editReply(`📭 Không có key nào thuộc nhóm **${filterLabel[filter] ?? filter}** để xóa.`);
+        return;
+      }
+
+      // Hiển thị cảnh báo + nút xác nhận
+      const confirmEmbed = new EmbedBuilder()
+        .setColor(0xff1744)
+        .setTitle("⚠️  XÁC NHẬN XÓA HÀNG LOẠT KEY")
+        .setDescription(
+          `Bạn sắp xóa **${targets.length}** ${filterLabel[filter] ?? filter}.\n\n` +
+          `> ❌ Hành động này **KHÔNG THỂ HOÀN TÁC**.\n` +
+          `> Tất cả thiết bị liên kết với các key này cũng sẽ bị xóa.\n\n` +
+          `Nhấn **✅ Xác nhận** để tiếp tục, hoặc **❌ Hủy** để thoát.`,
+        )
+        .addFields({ name: "🔢 Số key sẽ xóa", value: `${targets.length}`, inline: true })
+        .setFooter({ text: "Lệnh hết hạn sau 30 giây nếu không có phản hồi" })
+        .setTimestamp();
+
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId("xoatatkey:confirm")
+          .setLabel("✅  Xác nhận xóa")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId("xoatatkey:cancel")
+          .setLabel("❌  Hủy")
+          .setStyle(ButtonStyle.Secondary),
+      );
+
+      const msg = await interaction.editReply({ embeds: [confirmEmbed], components: [row] });
+
+      // Đợi người dùng bấm nút (30 giây)
+      const collector = msg.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: 30_000,
+        max: 1,
+      });
+
+      collector.on("collect", async (btn: ButtonInteraction) => {
+        if (btn.user.id !== interaction.user.id) {
+          await btn.reply({ content: "❌ Bạn không thể xác nhận lệnh này.", flags: 64 });
+          return;
+        }
+
+        if (btn.customId === "xoatatkey:cancel") {
+          const cancelEmbed = new EmbedBuilder()
+            .setColor(0x607d8b)
+            .setTitle("↩️ Đã hủy")
+            .setDescription("Không có key nào bị xóa.")
+            .setTimestamp();
+          await btn.update({ embeds: [cancelEmbed], components: [] });
+          return;
+        }
+
+        // Xác nhận — thực hiện xóa
+        await btn.deferUpdate();
+
+        const targetIds = targets.map(k => k.id);
+
+        // Xóa thiết bị liên kết trước, sau đó xóa key
+        let deletedDevices = 0;
+        for (const id of targetIds) {
+          const devs = await db.delete(devicesTable).where(eq(devicesTable.keyId, id)).returning();
+          deletedDevices += devs.length;
+        }
+        for (const id of targetIds) {
+          await db.delete(keysTable).where(eq(keysTable.id, id));
+        }
+
+        const doneEmbed = new EmbedBuilder()
+          .setColor(0xff1744)
+          .setTitle("🗑️ Xóa hàng loạt hoàn tất")
+          .setDescription(`Đã xóa **${targets.length}** ${filterLabel[filter] ?? filter}.`)
+          .addFields(
+            { name: "🗝️ Key đã xóa",       value: `${targets.length}`,  inline: true },
+            { name: "📱 Thiết bị đã xóa",   value: `${deletedDevices}`,  inline: true },
+          )
+          .setFooter({ text: `Thực hiện bởi ${interaction.user.tag}` })
+          .setTimestamp();
+
+        await interaction.editReply({ embeds: [doneEmbed], components: [] });
+      });
+
+      collector.on("end", async (collected) => {
+        if (collected.size === 0) {
+          // Hết thời gian, vô hiệu hóa nút
+          const timeoutEmbed = new EmbedBuilder()
+            .setColor(0x607d8b)
+            .setTitle("⏰ Hết thời gian xác nhận")
+            .setDescription("Lệnh đã bị hủy do không có phản hồi trong 30 giây.")
+            .setTimestamp();
+          await interaction.editReply({ embeds: [timeoutEmbed], components: [] }).catch(() => {});
+        }
+      });
     }
 
   } catch (err) {
