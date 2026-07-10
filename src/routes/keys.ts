@@ -23,21 +23,23 @@ function generateKey(): string {
   return `${seg()}-${seg()}-${seg()}-${seg()}`;
 }
 
-// Lấy thông báo chưa đọc của một deviceId
+// Lấy thông báo chưa đọc của một deviceId, cùng danh sách id còn tồn tại trên server
+// (để client dọn dẹp những thông báo đã bị admin xoá khỏi lịch sử cục bộ).
 async function getPendingNotifications(deviceId: string) {
   const allNotifs = await db.select().from(notificationsTable).orderBy(notificationsTable.createdAt);
-  if (allNotifs.length === 0) return [];
+  const activeIds = allNotifs.map(n => n.id);
+  if (allNotifs.length === 0) return { pending: [] as { id: number; title: string; body: string }[], activeIds };
 
-  const allIds = allNotifs.map(n => n.id);
   const reads = await db.select().from(notificationReadsTable)
-    .where(and(eq(notificationReadsTable.deviceId, deviceId), inArray(notificationReadsTable.notificationId, allIds)));
+    .where(and(eq(notificationReadsTable.deviceId, deviceId), inArray(notificationReadsTable.notificationId, activeIds)));
 
   const readIds = new Set(reads.map(r => r.notificationId));
-  return allNotifs.filter(n => !readIds.has(n.id)).map(n => ({
+  const pending = allNotifs.filter(n => !readIds.has(n.id)).map(n => ({
     id: n.id,
     title: n.title,
     body: n.body,
   }));
+  return { pending, activeIds };
 }
 
 // ── Validate key ─────────────────────────────────────────────────────────────
@@ -126,14 +128,20 @@ router.post("/keys/heartbeat", async (req, res): Promise<void> => {
     .set({ lastSeen: new Date() })
     .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
 
-  // Lấy thông báo chưa đọc
-  const notifications = await getPendingNotifications(deviceId);
+  // Lấy thông báo chưa đọc + danh sách id còn tồn tại (để client dọn thông báo đã bị xoá)
+  const { pending, activeIds } = await getPendingNotifications(deviceId);
+  const deviceCount = await db.select({ count: sql<number>`count(*)` })
+    .from(devicesTable)
+    .where(eq(devicesTable.keyId, record.id));
 
   res.json({
     ok: true,
     tier: record.tier,
     note: record.note,
-    notifications,
+    maxDevices: record.maxDevices,
+    deviceCount: Number(deviceCount[0]?.count ?? 1),
+    notifications: pending,
+    activeNotificationIds: activeIds,
   });
 });
 
