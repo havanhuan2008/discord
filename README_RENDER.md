@@ -1,5 +1,29 @@
 # Aujunpeak API — Hướng dẫn deploy lên Render
 
+## Các lệnh bot Discord (đã cải tiến)
+
+**Quản lý key:**
+- `/taokey` — tạo key mới; có thêm tùy chọn `key` để **tự đặt nội dung key** (bỏ trống để bot tự sinh ngẫu nhiên)
+- `/suakey` — sửa nhãn / ghi chú / số thiết bị tối đa của key đã tạo
+- `/danhsachkey` — xem **toàn bộ key**, có **phân trang bằng nút bấm** (không còn giới hạn 20 key — hiển thị hết, 20 key/trang), kèm bộ lọc theo trạng thái/loại (đang hoạt động, đã khóa, hết hạn, VIP, FREE)
+- `/xemkey`, `/khoakey`, `/mokey`, `/xoakey`, `/giahan`, `/nangcap` — như cũ
+- `/thietbi`, `/xoathietbi`, `/online`, `/thongke` — như cũ
+
+**Quản lý thông báo:**
+- `/thongbao` — gửi thông báo đến tất cả người dùng (như cũ)
+- `/danhsachthongbao` — xem **toàn bộ thông báo đã gửi**, có phân trang bằng nút bấm, hiển thị ID để dùng khi xóa
+- `/xoathongbao <id>` — xóa một thông báo theo ID
+- `/xoatatthongbao` — xóa toàn bộ thông báo cùng lúc
+
+**API admin mới (dùng header `x-admin-secret`):**
+- `GET /api/admin/keys` — không truyền `page`/`pageSize` sẽ trả về TOÀN BỘ key; truyền cả hai để phân trang
+- `POST /api/admin/keys` — hỗ trợ trường `key` để tạo key tùy chỉnh (validate trùng lặp)
+- `PATCH /api/admin/keys/:id` — sửa `label`/`note`/`maxDevices`
+- `GET /api/admin/notifications` — danh sách thông báo (hỗ trợ phân trang giống trên)
+- `DELETE /api/admin/notifications/:id` — xóa 1 thông báo
+- `DELETE /api/admin/notifications` — xóa toàn bộ thông báo
+
+
 ## Yêu cầu
 - Tài khoản Render.com (miễn phí)
 - Database PostgreSQL (Render cung cấp miễn phí)

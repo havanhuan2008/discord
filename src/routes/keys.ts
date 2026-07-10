@@ -8,8 +8,9 @@ const router: IRouter = Router();
 const ADMIN_SECRET = process.env.ADMIN_SECRET_KEY ?? "";
 
 function requireAdmin(req: any, res: any, next: any): void {
-  const secret = req.headers["x-admin-secret"] ?? req.query.secret;
-  if (!secret || secret !== ADMIN_SECRET) {
+  // Chỉ chấp nhận secret qua header — query string dễ bị lộ qua log/lịch sử trình duyệt.
+  const secret = req.headers["x-admin-secret"];
+  if (!ADMIN_SECRET || !secret || secret !== ADMIN_SECRET) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
@@ -190,27 +191,111 @@ router.post("/admin/notify", requireAdmin, async (req, res): Promise<void> => {
   res.json({ ok: true, id: notif.id, title, body });
 });
 
-// ── Admin: CRUD keys ─────────────────────────────────────────────────────────
+// ── Admin: CRUD keys (hỗ trợ phân trang, không giới hạn 20) ──────────────────
 router.get("/admin/keys", requireAdmin, async (req, res): Promise<void> => {
   const keys = await db.select().from(keysTable).orderBy(keysTable.createdAt);
-  res.json({ ok: true, keys });
+
+  const page = req.query.page !== undefined ? parseInt(req.query.page as string, 10) : undefined;
+  const pageSize = req.query.pageSize !== undefined ? parseInt(req.query.pageSize as string, 10) : undefined;
+
+  if (page !== undefined && pageSize !== undefined && !isNaN(page) && !isNaN(pageSize) && pageSize > 0) {
+    const start = page * pageSize;
+    const paged = keys.slice(start, start + pageSize);
+    res.json({
+      ok: true,
+      keys: paged,
+      total: keys.length,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(keys.length / pageSize)),
+    });
+    return;
+  }
+
+  // Không truyền page/pageSize -> trả về TOÀN BỘ key, không giới hạn số lượng
+  res.json({ ok: true, keys, total: keys.length });
 });
 
 router.post("/admin/keys", requireAdmin, async (req, res): Promise<void> => {
-  const { days, maxDevices, label, note, discordUserId, tier } = req.body;
-  const key = generateKey();
+  const { days, maxDevices, label, note, discordUserId, tier, key: customKey } = req.body;
+
+  if (tier !== undefined && !["free", "vip"].includes(tier)) {
+    res.status(400).json({ ok: false, error: "tier phải là 'free' hoặc 'vip'" });
+    return;
+  }
+  if (maxDevices !== undefined && (!Number.isInteger(Number(maxDevices)) || Number(maxDevices) < 1)) {
+    res.status(400).json({ ok: false, error: "maxDevices phải là số nguyên >= 1" });
+    return;
+  }
+  if (days !== undefined && isNaN(Number(days))) {
+    res.status(400).json({ ok: false, error: "days phải là số" });
+    return;
+  }
+
+  let key: string;
+  if (customKey && String(customKey).trim().length > 0) {
+    key = String(customKey).trim().toUpperCase().replace(/\s+/g, "-");
+    if (key.length < 4) {
+      res.status(400).json({ ok: false, error: "Key tùy chỉnh phải có ít nhất 4 ký tự" });
+      return;
+    }
+    const [existing] = await db.select().from(keysTable).where(eq(keysTable.key, key));
+    if (existing) {
+      res.status(409).json({ ok: false, error: "Key đã tồn tại" });
+      return;
+    }
+  } else {
+    key = generateKey();
+  }
+
   const expiresAt = days && Number(days) > 0
     ? new Date(Date.now() + Number(days) * 86400000)
     : null;
-  const [record] = await db.insert(keysTable).values({
-    key,
-    label: label ?? "",
-    note: note ?? "",
-    maxDevices: maxDevices ?? 1,
-    expiresAt,
-    discordUserId: discordUserId ?? "",
-    tier: tier ?? "free",
-  }).returning();
+
+  try {
+    const [record] = await db.insert(keysTable).values({
+      key,
+      label: label ?? "",
+      note: note ?? "",
+      maxDevices: maxDevices ?? 1,
+      expiresAt,
+      discordUserId: discordUserId ?? "",
+      tier: tier ?? "free",
+    }).returning();
+    res.json({ ok: true, key: record });
+  } catch (err: any) {
+    // Race condition: 2 request cùng lúc tạo trùng key tùy chỉnh -> unique constraint violation (Postgres code 23505)
+    if (err?.code === "23505") {
+      res.status(409).json({ ok: false, error: "Key đã tồn tại" });
+      return;
+    }
+    logger.error({ err }, "Failed to create key");
+    res.status(500).json({ ok: false, error: "Không thể tạo key" });
+  }
+});
+
+router.patch("/admin/keys/:id", requireAdmin, async (req, res): Promise<void> => {
+  const id = parseInt(req.params.id as string, 10);
+  if (isNaN(id)) { res.status(400).json({ ok: false, error: "id không hợp lệ" }); return; }
+
+  const { label, note, maxDevices } = req.body;
+  if (maxDevices !== undefined && (!Number.isInteger(Number(maxDevices)) || Number(maxDevices) < 1)) {
+    res.status(400).json({ ok: false, error: "maxDevices phải là số nguyên >= 1" });
+    return;
+  }
+
+  const patch: Record<string, unknown> = {};
+  if (label !== undefined) patch.label = label;
+  if (note !== undefined) patch.note = note;
+  if (maxDevices !== undefined) patch.maxDevices = maxDevices;
+
+  if (Object.keys(patch).length === 0) {
+    res.status(400).json({ ok: false, error: "Không có trường nào để cập nhật" });
+    return;
+  }
+
+  const [record] = await db.update(keysTable).set(patch).where(eq(keysTable.id, id)).returning();
+  if (!record) { res.status(404).json({ ok: false }); return; }
   res.json({ ok: true, key: record });
 });
 
@@ -268,6 +353,47 @@ router.delete("/admin/keys/:id/devices/:deviceId", requireAdmin, async (req, res
   const devId = parseInt(req.params.deviceId as string, 10);
   await db.delete(devicesTable).where(and(eq(devicesTable.keyId, keyId), eq(devicesTable.id, devId)));
   res.json({ ok: true });
+});
+
+// ── Admin: Quản lý thông báo (danh sách + xóa) ───────────────────────────────
+router.get("/admin/notifications", requireAdmin, async (req, res): Promise<void> => {
+  const notifs = await db.select().from(notificationsTable).orderBy(sql`${notificationsTable.createdAt} DESC`);
+
+  const page = req.query.page !== undefined ? parseInt(req.query.page as string, 10) : undefined;
+  const pageSize = req.query.pageSize !== undefined ? parseInt(req.query.pageSize as string, 10) : undefined;
+
+  if (page !== undefined && pageSize !== undefined && !isNaN(page) && !isNaN(pageSize) && pageSize > 0) {
+    const start = page * pageSize;
+    const paged = notifs.slice(start, start + pageSize);
+    res.json({
+      ok: true,
+      notifications: paged,
+      total: notifs.length,
+      page,
+      pageSize,
+      totalPages: Math.max(1, Math.ceil(notifs.length / pageSize)),
+    });
+    return;
+  }
+
+  res.json({ ok: true, notifications: notifs, total: notifs.length });
+});
+
+router.delete("/admin/notifications/:id", requireAdmin, async (req, res): Promise<void> => {
+  const id = parseInt(req.params.id as string, 10);
+  const [existing] = await db.select().from(notificationsTable).where(eq(notificationsTable.id, id));
+  if (!existing) { res.status(404).json({ ok: false }); return; }
+
+  await db.delete(notificationsTable).where(eq(notificationsTable.id, id));
+  await db.delete(notificationReadsTable).where(eq(notificationReadsTable.notificationId, id));
+  res.json({ ok: true });
+});
+
+router.delete("/admin/notifications", requireAdmin, async (req, res): Promise<void> => {
+  const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(notificationsTable);
+  await db.delete(notificationReadsTable);
+  await db.delete(notificationsTable);
+  res.json({ ok: true, deleted: Number(count) });
 });
 
 router.get("/admin/stats", requireAdmin, async (req, res): Promise<void> => {

@@ -5,20 +5,49 @@ import {
   Routes,
   SlashCommandBuilder,
   ChatInputCommandInteraction,
+  ButtonInteraction,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType,
+  PermissionFlagsBits,
 } from "discord.js";
 import { eq, and, sql } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable } from "../db";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable } from "../db";
 import { logger } from "./logger";
 
 const TOKEN    = process.env.DISCORD_BOT_TOKEN ?? "";
 const GUILD_ID = process.env.DISCORD_GUILD_ID  ?? "";
+
+// Danh sách user Discord được phép chạy lệnh quản trị (ngoài quyền Administrator/ManageGuild của server).
+// Đặt biến môi trường DISCORD_ADMIN_IDS="id1,id2" nếu muốn giới hạn thêm theo user cụ thể.
+const EXTRA_ADMIN_IDS = new Set(
+  (process.env.DISCORD_ADMIN_IDS ?? "").split(",").map(s => s.trim()).filter(Boolean)
+);
+
+function isAuthorizedAdmin(interaction: ChatInputCommandInteraction): boolean {
+  if (EXTRA_ADMIN_IDS.has(interaction.user.id)) return true;
+  const member = interaction.member;
+  if (!member || typeof member.permissions === "string") return false;
+  return (
+    member.permissions.has(PermissionFlagsBits.Administrator) ||
+    member.permissions.has(PermissionFlagsBits.ManageGuild)
+  );
+}
+
+const PAGE_SIZE = 20;
 
 function generateKey(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const seg = () =>
     Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
   return `${seg()}-${seg()}-${seg()}-${seg()}`;
+}
+
+function normalizeCustomKey(raw: string): string {
+  // Cho phép người dùng nhập tự do, chỉ chuẩn hoá về chữ hoa + khoảng trắng -> gạch ngang
+  return raw.trim().toUpperCase().replace(/\s+/g, "-");
 }
 
 function formatDate(d: Date | null | undefined): string {
@@ -36,8 +65,42 @@ function tierBadge(tier: string): string {
   return tier === "vip" ? "👑 VIP" : "🆓 FREE";
 }
 
+function paginationRow(page: number, totalPages: number, prefix: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:first:${page}`)
+      .setEmoji("⏮️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:prev:${page}`)
+      .setEmoji("◀️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:label:${page}`)
+      .setLabel(`Trang ${page + 1}/${totalPages}`)
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(true),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:next:${page}`)
+      .setEmoji("▶️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1),
+    new ButtonBuilder()
+      .setCustomId(`${prefix}:last:${page}`)
+      .setEmoji("⏭️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages - 1),
+  );
+}
+
+// Toàn bộ lệnh đều là lệnh quản trị. Ẩn khỏi menu với user không có quyền
+// Manage Server theo mặc định (server admin có thể tùy chỉnh lại trong Server Settings > Integrations).
+// Đây chỉ là lớp bảo vệ ở UI Discord — quyền thực sự vẫn được kiểm tra lại trong isAuthorizedAdmin().
 const commands = [
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("taokey")
     .setDescription("Tạo key mới")
     .addIntegerOption(o => o.setName("ngay").setDescription("Số ngày hiệu lực (0 = vĩnh viễn)").setRequired(true))
@@ -45,9 +108,11 @@ const commands = [
     .addIntegerOption(o => o.setName("thietbi").setDescription("Số thiết bị tối đa").setRequired(false))
     .addStringOption(o => o.setName("nhan").setDescription("Nhãn / tên key").setRequired(false))
     .addStringOption(o => o.setName("ghichu").setDescription("Ghi chú hiển thị trong app").setRequired(false))
+    .addStringOption(o => o.setName("key").setDescription("Tùy chỉnh nội dung key (bỏ trống để tự sinh)").setRequired(false))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("nangcap")
     .setDescription("Nâng cấp / hạ cấp tier của key")
     .addStringOption(o => o.setName("key").setDescription("Key cần đổi tier").setRequired(true))
@@ -55,35 +120,63 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("xemkey")
     .setDescription("Xem thông tin một key")
     .addStringOption(o => o.setName("key").setDescription("Key cần xem").setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("danhsachkey")
-    .setDescription("Xem toàn bộ key (tối đa 20)")
+    .setDescription("Xem toàn bộ key (có phân trang, không giới hạn 20)")
+    .addStringOption(o =>
+      o.setName("loc")
+        .setDescription("Lọc theo trạng thái/loại")
+        .setRequired(false)
+        .addChoices(
+          { name: "Tất cả", value: "all" },
+          { name: "Đang hoạt động", value: "active" },
+          { name: "Đã khóa", value: "locked" },
+          { name: "Hết hạn", value: "expired" },
+          { name: "VIP", value: "vip" },
+          { name: "FREE", value: "free" },
+        ))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("suakey")
+    .setDescription("Sửa nhãn / ghi chú / số thiết bị tối đa của key")
+    .addStringOption(o => o.setName("key").setDescription("Key cần sửa").setRequired(true))
+    .addStringOption(o => o.setName("nhan").setDescription("Nhãn mới").setRequired(false))
+    .addStringOption(o => o.setName("ghichu").setDescription("Ghi chú mới").setRequired(false))
+    .addIntegerOption(o => o.setName("thietbi").setDescription("Số thiết bị tối đa mới").setRequired(false))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("khoakey")
     .setDescription("Khóa key (người dùng bị đẩy ra ngay lập tức)")
     .addStringOption(o => o.setName("key").setDescription("Key cần khóa").setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("mokey")
     .setDescription("Mở khóa key")
     .addStringOption(o => o.setName("key").setDescription("Key cần mở").setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("xoakey")
     .setDescription("Xóa key vĩnh viễn")
     .addStringOption(o => o.setName("key").setDescription("Key cần xóa").setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("giahan")
     .setDescription("Gia hạn key thêm N ngày")
     .addStringOption(o => o.setName("key").setDescription("Key cần gia hạn").setRequired(true))
@@ -91,12 +184,14 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("thietbi")
     .setDescription("Xem thiết bị đang đăng nhập của key")
     .addStringOption(o => o.setName("key").setDescription("Key cần xem").setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("xoathietbi")
     .setDescription("Xóa thiết bị khỏi key (theo thứ tự trong /thietbi)")
     .addStringOption(o => o.setName("key").setDescription("Key").setRequired(true))
@@ -104,20 +199,42 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("thongke")
     .setDescription("Thống kê tổng quan hệ thống key")
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("online")
     .setDescription("Xem thiết bị online trong 5 phút gần nhất")
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("thongbao")
     .setDescription("Gửi thông báo đến TẤT CẢ người dùng đang dùng app")
     .addStringOption(o => o.setName("tieude").setDescription("Tiêu đề thông báo").setRequired(true))
     .addStringOption(o => o.setName("noidung").setDescription("Nội dung thông báo").setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("danhsachthongbao")
+    .setDescription("Xem danh sách thông báo đã gửi (có phân trang)")
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("xoathongbao")
+    .setDescription("Xóa một thông báo theo ID")
+    .addIntegerOption(o => o.setName("id").setDescription("ID thông báo (xem trong /danhsachthongbao)").setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("xoatatthongbao")
+    .setDescription("Xóa TẤT CẢ thông báo đã gửi")
     .toJSON(),
 ];
 
@@ -126,7 +243,92 @@ async function findKey(keyStr: string) {
   return record ?? null;
 }
 
+// ── Danh sách key: build embed cho 1 trang ──────────────────────────────────
+function buildKeyListEmbed(
+  keys: Array<typeof keysTable.$inferSelect>,
+  page: number,
+  totalPages: number,
+  totalCount: number,
+  filterLabel: string,
+) {
+  const start = page * PAGE_SIZE;
+  const pageItems = keys.slice(start, start + PAGE_SIZE);
+
+  const lines = pageItems.map((k, i) => {
+    const exp = k.expiresAt ? `hết ${formatDate(k.expiresAt)}` : "vĩnh viễn";
+    return `${start + i + 1}. ${statusEmoji(k)} \`${k.key}\` — ${tierBadge(k.tier)} — ${k.label || "no label"} — ${exp}`;
+  });
+
+  return new EmbedBuilder()
+    .setColor(0x7c4dff)
+    .setTitle(`🗝️ Danh sách key (${totalCount}) ${filterLabel}`)
+    .setDescription(lines.length ? lines.join("\n") : "📭 Không có key phù hợp.")
+    .setFooter({ text: `Trang ${page + 1}/${totalPages} · ${PAGE_SIZE} key/trang` })
+    .setTimestamp();
+}
+
+async function fetchKeysForFilter(filter: string) {
+  const all = await db.select().from(keysTable).orderBy(keysTable.createdAt);
+  const now = new Date();
+  switch (filter) {
+    case "active":
+      return all.filter((k: typeof all[number]) => k.isActive && !(k.expiresAt && k.expiresAt < now));
+    case "locked":
+      return all.filter((k: typeof all[number]) => !k.isActive);
+    case "expired":
+      return all.filter((k: typeof all[number]) => k.isActive && k.expiresAt && k.expiresAt < now);
+    case "vip":
+      return all.filter((k: typeof all[number]) => k.tier === "vip");
+    case "free":
+      return all.filter((k: typeof all[number]) => k.tier === "free");
+    default:
+      return all;
+  }
+}
+
+function filterDisplayLabel(filter: string): string {
+  switch (filter) {
+    case "active": return "· Đang hoạt động";
+    case "locked": return "· Đã khóa";
+    case "expired": return "· Hết hạn";
+    case "vip": return "· VIP";
+    case "free": return "· FREE";
+    default: return "";
+  }
+}
+
+// ── Danh sách thông báo: build embed cho 1 trang ────────────────────────────
+function buildNotifListEmbed(
+  notifs: Array<typeof notificationsTable.$inferSelect>,
+  page: number,
+  totalPages: number,
+  totalCount: number,
+) {
+  const start = page * PAGE_SIZE;
+  const pageItems = notifs.slice(start, start + PAGE_SIZE);
+
+  const lines = pageItems.map((n, i) => {
+    const body = n.body.length > 80 ? `${n.body.slice(0, 80)}…` : n.body;
+    return `**#${n.id}** — 📌 ${n.title}\n📝 ${body}\n👤 ${n.sentBy} · 🕒 ${formatDate(n.createdAt)}`;
+  });
+
+  return new EmbedBuilder()
+    .setColor(0xff9800)
+    .setTitle(`📢 Danh sách thông báo (${totalCount})`)
+    .setDescription(lines.length ? lines.join("\n\n") : "📭 Chưa có thông báo nào.")
+    .setFooter({ text: `Trang ${page + 1}/${totalPages} · ${PAGE_SIZE} thông báo/trang · Dùng /xoathongbao <id> để xóa` })
+    .setTimestamp();
+}
+
 async function handleInteraction(interaction: ChatInputCommandInteraction) {
+  if (!isAuthorizedAdmin(interaction)) {
+    await interaction.reply({
+      content: "❌ Bạn không có quyền sử dụng lệnh quản trị này.",
+      flags: 64,
+    });
+    return;
+  }
+
   await interaction.deferReply({ flags: 64 });
 
   try {
@@ -139,24 +341,49 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const maxDev    = interaction.options.getInteger("thietbi") ?? 1;
       const label     = interaction.options.getString("nhan") ?? "";
       const note      = interaction.options.getString("ghichu") ?? "";
+      const customKey = interaction.options.getString("key");
       const tier      = ["free", "vip"].includes(tierInput.toLowerCase()) ? tierInput.toLowerCase() : "free";
 
-      const key = generateKey();
+      let key: string;
+      if (customKey && customKey.trim().length > 0) {
+        key = normalizeCustomKey(customKey);
+        if (key.length < 4) {
+          await interaction.editReply("❌ Key tùy chỉnh phải có ít nhất 4 ký tự.");
+          return;
+        }
+        const existing = await findKey(key);
+        if (existing) {
+          await interaction.editReply(`❌ Key \`${key}\` đã tồn tại. Vui lòng chọn nội dung khác.`);
+          return;
+        }
+      } else {
+        key = generateKey();
+      }
+
       const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000) : null;
 
-      const [record] = await db.insert(keysTable).values({
-        key,
-        label,
-        note,
-        maxDevices: maxDev,
-        expiresAt,
-        discordUserId: interaction.user.id,
-        tier,
-      }).returning();
+      let record: typeof keysTable.$inferSelect;
+      try {
+        [record] = await db.insert(keysTable).values({
+          key,
+          label,
+          note,
+          maxDevices: maxDev,
+          expiresAt,
+          discordUserId: interaction.user.id,
+          tier,
+        }).returning();
+      } catch (err: any) {
+        if (err?.code === "23505") {
+          await interaction.editReply(`❌ Key \`${key}\` đã tồn tại (trùng lặp). Vui lòng thử lại.`);
+          return;
+        }
+        throw err;
+      }
 
       const embed = new EmbedBuilder()
         .setColor(tier === "vip" ? 0xffd700 : 0x00bcd4)
-        .setTitle(`${tier === "vip" ? "👑" : "🆓"} Key đã được tạo`)
+        .setTitle(`${tier === "vip" ? "👑" : "🆓"} Key đã được tạo${customKey ? " (tùy chỉnh)" : ""}`)
         .addFields(
           { name: "🔑 Key",        value: `\`${record.key}\``,            inline: false },
           { name: "📛 Nhãn",       value: label || "—",                   inline: true  },
@@ -220,22 +447,95 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
 
     // ── /danhsachkey ─────────────────────────────────────────────────────────
     else if (cmd === "danhsachkey") {
-      const keys = await db.select().from(keysTable).orderBy(keysTable.createdAt);
-      const list = keys.slice(0, 20);
-      if (list.length === 0) {
-        await interaction.editReply("📭 Chưa có key nào.");
+      const filter = interaction.options.getString("loc") ?? "all";
+      const keys = await fetchKeysForFilter(filter);
+
+      if (keys.length === 0) {
+        await interaction.editReply("📭 Không có key phù hợp.");
         return;
       }
 
-      const lines = list.map((k, i) => {
-        const exp = k.expiresAt ? `hết ${formatDate(k.expiresAt)}` : "vĩnh viễn";
-        return `${i + 1}. ${statusEmoji(k)} \`${k.key}\` — ${tierBadge(k.tier)} — ${k.label || "no label"} — ${exp}`;
+      let totalPages = Math.max(1, Math.ceil(keys.length / PAGE_SIZE));
+      let page = 0;
+
+      const embed = buildKeyListEmbed(keys, page, totalPages, keys.length, filterDisplayLabel(filter));
+      const components = totalPages > 1 ? [paginationRow(page, totalPages, "keylist")] : [];
+
+      const message = await interaction.editReply({ embeds: [embed], components });
+      if (totalPages <= 1) return;
+
+      const collector = message.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: 5 * 60 * 1000,
       });
 
+      let busy = false;
+      collector.on("collect", async (btn: ButtonInteraction) => {
+        if (btn.user.id !== interaction.user.id) {
+          await btn.reply({ content: "❌ Bạn không thể điều khiển danh sách này.", flags: 64 });
+          return;
+        }
+        // Chặn click liên tiếp trong khi request trước đang xử lý, tránh cập nhật trang lệch thứ tự.
+        if (busy) {
+          await btn.deferUpdate().catch(() => {});
+          return;
+        }
+        busy = true;
+        try {
+          const [, action] = btn.customId.split(":");
+          if (action === "first") page = 0;
+          else if (action === "prev") page = Math.max(0, page - 1);
+          else if (action === "next") page = Math.min(totalPages - 1, page + 1);
+          else if (action === "last") page = totalPages - 1;
+
+          const freshKeys = await fetchKeysForFilter(filter);
+          const newTotalPages = Math.max(1, Math.ceil(freshKeys.length / PAGE_SIZE));
+          page = Math.min(page, newTotalPages - 1);
+          totalPages = newTotalPages;
+
+          const newEmbed = buildKeyListEmbed(freshKeys, page, newTotalPages, freshKeys.length, filterDisplayLabel(filter));
+          await btn.update({ embeds: [newEmbed], components: [paginationRow(page, newTotalPages, "keylist")] });
+        } finally {
+          busy = false;
+        }
+      });
+
+      collector.on("end", async () => {
+        await message.edit({ components: [] }).catch(() => {});
+      });
+    }
+
+    // ── /suakey ──────────────────────────────────────────────────────────────
+    else if (cmd === "suakey") {
+      const keyStr = interaction.options.getString("key", true);
+      const label  = interaction.options.getString("nhan");
+      const note   = interaction.options.getString("ghichu");
+      const maxDev = interaction.options.getInteger("thietbi");
+
+      const record = await findKey(keyStr);
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+
+      if (label === null && note === null && maxDev === null) {
+        await interaction.editReply("⚠️ Cần cung cấp ít nhất một trong: nhãn, ghichú, thietbi.");
+        return;
+      }
+
+      const patch: Partial<typeof keysTable.$inferInsert> = {};
+      if (label !== null) patch.label = label;
+      if (note !== null) patch.note = note;
+      if (maxDev !== null) patch.maxDevices = maxDev;
+
+      const [updated] = await db.update(keysTable).set(patch).where(eq(keysTable.id, record.id)).returning();
+
       const embed = new EmbedBuilder()
-        .setColor(0x7c4dff)
-        .setTitle(`🗝️ Danh sách key (${list.length})`)
-        .setDescription(lines.join("\n"))
+        .setColor(0x00bcd4)
+        .setTitle("✏️ Đã cập nhật key")
+        .addFields(
+          { name: "🔑 Key",      value: `\`${updated.key}\``,      inline: false },
+          { name: "📛 Nhãn",     value: updated.label || "—",       inline: true  },
+          { name: "📱 Thiết bị", value: `${updated.maxDevices}`,    inline: true  },
+          { name: "📝 Ghi chú",  value: updated.note || "—",        inline: false },
+        )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
     }
@@ -362,6 +662,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const [{ active }]  = await db.select({ active: sql<number>`count(*)` }).from(keysTable).where(eq(keysTable.isActive, true));
       const [{ devices }] = await db.select({ devices: sql<number>`count(*)` }).from(devicesTable);
       const [{ vip }]     = await db.select({ vip: sql<number>`count(*)` }).from(keysTable).where(and(eq(keysTable.isActive, true), eq(keysTable.tier, "vip")));
+      const [{ notifs }]  = await db.select({ notifs: sql<number>`count(*)` }).from(notificationsTable);
 
       const now = new Date();
       const expiredKeys = await db.select().from(keysTable).where(
@@ -378,6 +679,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
           { name: "👑 VIP",          value: `${Number(vip)}`,              inline: true },
           { name: "🆓 FREE",         value: `${Number(active) - Number(vip)}`, inline: true },
           { name: "📱 Thiết bị",     value: `${Number(devices)}`,          inline: true },
+          { name: "📢 Thông báo",    value: `${Number(notifs)}`,           inline: true },
         )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
@@ -429,6 +731,103 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
           { name: "📝 Nội dung", value: body,  inline: false },
         )
         .setFooter({ text: `ID: ${notif.id} · Bởi: ${interaction.user.tag}` })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /danhsachthongbao ────────────────────────────────────────────────────
+    else if (cmd === "danhsachthongbao") {
+      const notifs = await db.select().from(notificationsTable).orderBy(sql`${notificationsTable.createdAt} DESC`);
+
+      if (notifs.length === 0) {
+        await interaction.editReply("📭 Chưa có thông báo nào.");
+        return;
+      }
+
+      let totalPages = Math.max(1, Math.ceil(notifs.length / PAGE_SIZE));
+      let page = 0;
+
+      const embed = buildNotifListEmbed(notifs, page, totalPages, notifs.length);
+      const components = totalPages > 1 ? [paginationRow(page, totalPages, "notiflist")] : [];
+
+      const message = await interaction.editReply({ embeds: [embed], components });
+      if (totalPages <= 1) return;
+
+      const collector = message.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: 5 * 60 * 1000,
+      });
+
+      let busy = false;
+      collector.on("collect", async (btn: ButtonInteraction) => {
+        if (btn.user.id !== interaction.user.id) {
+          await btn.reply({ content: "❌ Bạn không thể điều khiển danh sách này.", flags: 64 });
+          return;
+        }
+        if (busy) {
+          await btn.deferUpdate().catch(() => {});
+          return;
+        }
+        busy = true;
+        try {
+          const [, action] = btn.customId.split(":");
+          if (action === "first") page = 0;
+          else if (action === "prev") page = Math.max(0, page - 1);
+          else if (action === "next") page = Math.min(totalPages - 1, page + 1);
+          else if (action === "last") page = totalPages - 1;
+
+          const freshNotifs = await db.select().from(notificationsTable).orderBy(sql`${notificationsTable.createdAt} DESC`);
+          const newTotalPages = Math.max(1, Math.ceil(freshNotifs.length / PAGE_SIZE));
+          page = Math.min(page, newTotalPages - 1);
+          totalPages = newTotalPages;
+
+          const newEmbed = buildNotifListEmbed(freshNotifs, page, newTotalPages, freshNotifs.length);
+          await btn.update({ embeds: [newEmbed], components: [paginationRow(page, newTotalPages, "notiflist")] });
+        } finally {
+          busy = false;
+        }
+      });
+
+      collector.on("end", async () => {
+        await message.edit({ components: [] }).catch(() => {});
+      });
+    }
+
+    // ── /xoathongbao ─────────────────────────────────────────────────────────
+    else if (cmd === "xoathongbao") {
+      const id = interaction.options.getInteger("id", true);
+      const [existing] = await db.select().from(notificationsTable).where(eq(notificationsTable.id, id));
+      if (!existing) { await interaction.editReply(`❌ Không tìm thấy thông báo #${id}.`); return; }
+
+      await db.delete(notificationsTable).where(eq(notificationsTable.id, id));
+      await db.delete(notificationReadsTable).where(eq(notificationReadsTable.notificationId, id));
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff6d00)
+        .setTitle("🗑️ Đã xóa thông báo")
+        .addFields(
+          { name: "🆔 ID",       value: `#${existing.id}`,   inline: true  },
+          { name: "📌 Tiêu đề",  value: existing.title,      inline: true  },
+        )
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /xoatatthongbao ──────────────────────────────────────────────────────
+    else if (cmd === "xoatatthongbao") {
+      const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(notificationsTable);
+      if (Number(count) === 0) {
+        await interaction.editReply("📭 Không có thông báo nào để xóa.");
+        return;
+      }
+
+      await db.delete(notificationReadsTable);
+      await db.delete(notificationsTable);
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff1744)
+        .setTitle("🗑️ Đã xóa tất cả thông báo")
+        .setDescription(`Đã xóa **${Number(count)}** thông báo.`)
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
     }
