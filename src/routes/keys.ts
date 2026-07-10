@@ -142,229 +142,372 @@ router.post("/keys/generate-free-link", async (req, res): Promise<void> => {
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/keys/get-free-page", async (req, res): Promise<void> => {
   const deviceId   = (req.query.deviceId   as string) ?? "";
-  const deviceName = (req.query.deviceName as string) ?? "Unknown Device";
+  const deviceName = decodeURIComponent((req.query.deviceName as string) ?? "Unknown Device");
 
   if (!deviceId) {
-    res.status(400).send("Thiếu deviceId");
-    return;
+    res.status(400).send("<h2>Thiếu deviceId</h2>"); return;
   }
 
-  // Kiểm tra thiết bị này có key free còn hạn không (tránh spam)
-  const allKeys = await db.select().from(keysTable).where(
-    and(eq(keysTable.tier, "free"), eq(keysTable.isActive, true))
-  );
-  for (const k of allKeys) {
-    const devs = await db.select().from(devicesTable).where(eq(devicesTable.keyId, k.id));
-    const thisdev = devs.find(d => d.deviceId === deviceId);
-    if (thisdev && k.expiresAt && new Date() < k.expiresAt) {
-      // Thiết bị còn key free đang hoạt động → redirect thẳng đến trang thành công
-      const remaining = Math.ceil((k.expiresAt.getTime() - Date.now()) / 60000);
-      res.redirect(`${API_BASE_URL}/api/keys/free-success?key=${encodeURIComponent(k.key)}&deviceName=${encodeURIComponent(deviceName)}&remaining=${remaining}`);
-      return;
-    }
-  }
-
-  // Tạo claim token mới
+  // Tạo claim token + gọi Link4m server-side
   const token = generateToken();
   claimTokens.set(token, { deviceId, deviceName, createdAt: Date.now(), used: false });
 
-  // Tạo link4m bọc claim URL
-  const claimUrl = `${API_BASE_URL}/api/keys/claim-free?deviceId=${encodeURIComponent(deviceId)}&deviceName=${encodeURIComponent(deviceName)}&token=${encodeURIComponent(token)}`;
-  let link4mUrl  = claimUrl; // fallback
-  try {
-    link4mUrl = await createLink4mUrl(claimUrl);
-  } catch (e) {
-    logger.error({ err: e }, "Link4m API error — dùng direct link thay thế");
-  }
+  const claimUrl = `${API_BASE_URL}/api/keys/claim-free`
+    + `?deviceId=${encodeURIComponent(deviceId)}`
+    + `&deviceName=${encodeURIComponent(deviceName)}`
+    + `&token=${encodeURIComponent(token)}`;
+
+  let link4mUrl = claimUrl; // fallback nếu Link4m lỗi
+  try { link4mUrl = await createLink4mUrl(claimUrl); } catch (_) {}
+
+  const safeName = escapeHtml(deviceName);
+  const safeId   = escapeHtml(deviceId.substring(0, 20)) + "…";
+  const safeUrl  = escapeHtml(link4mUrl);
 
   const html = `<!DOCTYPE html>
 <html lang="vi">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Aujunpeak — Lấy Key Miễn Phí</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet"/>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{min-height:100vh;background:radial-gradient(ellipse at top,#1a0010 0%,#0a0008 60%,#000 100%);font-family:'Inter',sans-serif;color:#fff;overflow-x:hidden}
-    .particles{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
-    .particle{position:absolute;border-radius:50%;animation:floatUp linear infinite;opacity:0}
-    @keyframes floatUp{0%{transform:translateY(100vh) scale(0);opacity:0}10%{opacity:.7}90%{opacity:.4}100%{transform:translateY(-20vh) scale(1.2);opacity:0}}
-    .container{position:relative;z-index:1;max-width:480px;margin:0 auto;padding:24px 16px 48px}
-    .logo-wrap{text-align:center;margin-bottom:32px;padding-top:16px}
-    .logo-circle{width:90px;height:90px;border-radius:50%;background:linear-gradient(135deg,#ff1744,#8b0000);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;box-shadow:0 0 40px rgba(255,23,68,.5),0 0 80px rgba(255,23,68,.2);animation:pulse 2.4s ease-in-out infinite}
-    @keyframes pulse{0%,100%{box-shadow:0 0 40px rgba(255,23,68,.5),0 0 80px rgba(255,23,68,.2)}50%{box-shadow:0 0 60px rgba(255,23,68,.8),0 0 120px rgba(255,23,68,.4)}}
-    .logo-circle svg{width:48px;height:48px}
-    .brand{font-size:28px;font-weight:900;letter-spacing:.08em;background:linear-gradient(90deg,#ff1744,#ff8a80,#ff1744);background-size:200%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:shimmer 3s linear infinite}
-    @keyframes shimmer{0%{background-position:0%}100%{background-position:200%}}
-    .tagline{color:#77ffffff;font-size:13px;margin-top:6px;letter-spacing:.04em}
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Xác thực thiết bị · Aujunpeak</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
+body{min-height:100vh;background:#070b12;font-family:'Inter',sans-serif;color:#fff;overflow-x:hidden}
 
-    .card{background:linear-gradient(145deg,rgba(255,23,68,.12),rgba(139,0,0,.08));border:1px solid rgba(255,23,68,.25);border-radius:20px;padding:20px;margin-bottom:16px;backdrop-filter:blur(12px);position:relative;overflow:hidden}
-    .card::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,23,68,.04),transparent);animation:scanline 4s linear infinite}
-    @keyframes scanline{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
-    .card-title{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#ff6666;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-    .card-title::before{content:'';width:20px;height:2px;background:#ff1744;border-radius:2px}
+/* Background glow */
+.bg-glow{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
+.glow-1{position:absolute;top:-20%;left:-15%;width:65%;height:65%;
+  background:radial-gradient(circle,rgba(255,152,0,.14) 0%,transparent 70%);
+  animation:g1 9s ease-in-out infinite alternate}
+.glow-2{position:absolute;bottom:-15%;right:-10%;width:55%;height:55%;
+  background:radial-gradient(circle,rgba(255,87,34,.1) 0%,transparent 70%);
+  animation:g2 12s ease-in-out infinite alternate}
+@keyframes g1{to{transform:translate(8%,12%) scale(1.15)}}
+@keyframes g2{to{transform:translate(-7%,-8%) scale(1.2)}}
 
-    .device-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
-    .device-row:last-child{border-bottom:none;padding-bottom:0}
-    .device-icon{width:32px;height:32px;border-radius:10px;background:rgba(255,23,68,.15);display:flex;align-items:center;justify-content:center;flex-shrink:0}
-    .device-icon svg{width:18px;height:18px;fill:none;stroke:#ff6666;stroke-width:1.8}
-    .device-label{font-size:11px;color:#88aacc;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px}
-    .device-value{font-size:13px;color:#fff;font-weight:600;word-break:break-all}
-    .device-value.mono{font-family:'JetBrains Mono',monospace;font-size:11px;color:#ff9999}
+/* Floating particles */
+.pts{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.pt{position:absolute;border-radius:50%;animation:ptUp linear infinite;opacity:0}
+@keyframes ptUp{
+  0%{transform:translateY(105vh) scale(0);opacity:0}
+  8%{opacity:.55}92%{opacity:.18}
+  100%{transform:translateY(-5vh) scale(1.1);opacity:0}
+}
 
-    .verify-status{display:flex;align-items:center;gap:10px;padding:12px 16px;border-radius:12px;background:rgba(0,200,83,.1);border:1px solid rgba(0,200,83,.25);margin-top:4px}
-    .verify-dot{width:10px;height:10px;border-radius:50%;background:#00c853;box-shadow:0 0 12px rgba(0,200,83,.6);animation:blink 1.5s ease-in-out infinite;flex-shrink:0}
-    @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
-    .verify-text{font-size:12px;color:#66ffb2;font-weight:600}
+.wrap{position:relative;z-index:1;max-width:430px;margin:0 auto;padding:32px 18px 64px}
 
-    .steps{display:flex;flex-direction:column;gap:10px;margin-bottom:4px}
-    .step{display:flex;align-items:flex-start;gap:12px}
-    .step-num{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#ff1744,#8b0000);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;flex-shrink:0;margin-top:1px}
-    .step-text{font-size:12px;color:#aaccdd;line-height:1.6}
-    .step-text strong{color:#fff}
+/* ── Header ── */
+.hdr{text-align:center;margin-bottom:32px}
+.logo-wrap{position:relative;width:80px;height:80px;margin:0 auto 18px}
+.logo-bg{
+  width:80px;height:80px;border-radius:50%;
+  background:linear-gradient(135deg,#FF8C00,#FF5722);
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 0 0 rgba(255,140,0,.6);
+  animation:pulse 2.5s ease-out infinite;
+}
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(255,140,0,.55)}
+  70%{box-shadow:0 0 0 18px rgba(255,140,0,0)}
+  100%{box-shadow:0 0 0 0 rgba(255,140,0,0)}
+}
+.logo-ring{
+  position:absolute;inset:-6px;border-radius:50%;
+  border:2px solid transparent;
+  border-top:2px solid #FF9800;
+  border-right:2px solid rgba(255,152,0,.25);
+  animation:spin 3s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hdr-title{font-size:24px;font-weight:900;letter-spacing:-.02em;margin-bottom:7px}
+.hdr-title em{color:#FF9800;font-style:normal}
+.hdr-sub{font-size:13px;color:#607080;font-weight:500;line-height:1.5}
 
-    .link-box{background:rgba(0,0,0,.4);border:1px solid rgba(255,23,68,.3);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:10px;margin-top:12px}
-    .link-url{flex:1;font-family:'JetBrains Mono',monospace;font-size:11px;color:#ff9999;word-break:break-all;line-height:1.4}
-    .btn-copy{flex-shrink:0;padding:8px 14px;border-radius:8px;background:linear-gradient(135deg,#ff1744,#cc0022);border:none;color:#fff;font-size:12px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap}
-    .btn-copy:active{transform:scale(.96)}
-    .btn-copy.copied{background:linear-gradient(135deg,#00c853,#00963f)}
+/* ── Cards ── */
+.card{
+  background:linear-gradient(145deg,rgba(255,140,0,.07) 0%,rgba(12,18,28,.75) 100%);
+  border:1px solid rgba(255,140,0,.16);
+  border-radius:22px;padding:20px;margin-bottom:14px;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  overflow:hidden;position:relative;
+}
+.card-shine{
+  position:absolute;top:0;left:-120%;width:60%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.04),transparent);
+  animation:cshine 7s linear infinite;
+}
+@keyframes cshine{to{left:160%}}
+.card-hd{font-size:10.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;
+  color:#FF9800;opacity:.9;margin-bottom:14px;display:flex;align-items:center;gap:7px}
+.card-hd::before{content:'';width:18px;height:2px;background:#FF9800;border-radius:2px}
 
-    .btn-open{display:block;width:100%;padding:16px;border-radius:14px;background:linear-gradient(135deg,#ff1744,#8b0000);border:none;color:#fff;font-size:15px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;transition:all .25s;text-align:center;text-decoration:none;margin-top:4px;box-shadow:0 8px 32px rgba(255,23,68,.35)}
-    .btn-open:active{transform:scale(.98)}
-    .btn-open:hover{box-shadow:0 12px 40px rgba(255,23,68,.5)}
+/* Device rows */
+.dr{display:flex;align-items:center;gap:13px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.dr:last-child{border:none;padding-bottom:0}
+.dr-ic{width:32px;height:32px;border-radius:10px;background:rgba(255,140,0,.11);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.dr-ic svg{width:16px;height:16px;stroke:#FF9800;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.dr-meta{flex:1;min-width:0}
+.dr-lbl{font-size:10px;color:#4a6070;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:3px}
+.dr-val{font-size:13px;color:#dde8f2;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dr-val.mono{font-family:'JetBrains Mono',monospace;font-size:11px;color:#FF9855;letter-spacing:.02em}
 
-    .timer-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:20px;background:rgba(255,152,0,.12);border:1px solid rgba(255,152,0,.3);font-size:11px;color:#ffcc80;font-weight:600;margin-top:8px}
-    .footer{text-align:center;color:#334455;font-size:11px;margin-top:32px}
+/* ── Verification steps ── */
+.steps{display:flex;flex-direction:column;gap:2px}
+.srow{
+  display:flex;align-items:center;gap:13px;
+  padding:14px 4px;border-bottom:1px solid rgba(255,255,255,.04);
+  opacity:0;transform:translateX(-14px);
+  transition:opacity .45s ease,transform .45s ease;
+}
+.srow:last-child{border:none}
+.srow.vis{opacity:1;transform:translateX(0)}
 
-    @keyframes fadeSlideUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
-    .card{animation:fadeSlideUp .5s ease forwards}
-    .card:nth-child(2){animation-delay:.1s;opacity:0}
-    .card:nth-child(3){animation-delay:.2s;opacity:0}
-    .btn-open{animation:fadeSlideUp .5s ease .3s forwards;opacity:0}
-  </style>
+.s-ic{width:36px;height:36px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;position:relative;transition:all .3s ease}
+.s-ic.idle{background:rgba(255,255,255,.05);border:2px solid rgba(255,255,255,.09)}
+.s-ic.spin-state{background:rgba(255,140,0,.1);border:2px solid rgba(255,140,0,.28)}
+.s-ic.spin-state::after{
+  content:'';position:absolute;inset:-2px;border-radius:50%;
+  border:2.5px solid transparent;border-top-color:#FF9800;
+  animation:spin .75s linear infinite;
+}
+.s-ic.ok{background:rgba(0,220,80,.12);border:2px solid rgba(0,220,80,.32)}
+.s-ic svg{width:15px;height:15px;transition:all .3s ease}
+
+.s-body{flex:1}
+.s-name{font-size:13px;font-weight:700;color:#b8ccd8;margin-bottom:3px;transition:color .3s}
+.s-name.ok-text{color:#5debb0}
+.s-desc{font-size:11px;color:#3d5060;font-weight:400;line-height:1.5}
+
+.s-badge{
+  padding:3px 9px;border-radius:10px;font-size:10px;font-weight:700;
+  letter-spacing:.07em;white-space:nowrap;
+  background:rgba(0,220,80,.1);border:1px solid rgba(0,220,80,.22);
+  color:#55dd90;
+  opacity:0;transform:scale(.8);transition:all .3s ease;
+}
+.s-badge.show{opacity:1;transform:scale(1)}
+
+/* ── Get Key button section ── */
+.btn-wrap{
+  margin-top:4px;
+  opacity:0;transform:translateY(22px);
+  transition:opacity .55s ease,transform .55s ease;
+}
+.btn-wrap.show{opacity:1;transform:translateY(0)}
+
+.btn-get{
+  display:flex;align-items:center;justify-content:center;gap:11px;
+  width:100%;padding:18px 20px;border-radius:18px;
+  background:linear-gradient(135deg,#FF6D00 0%,#FF9800 50%,#FFC107 100%);
+  border:none;color:#fff;text-decoration:none;
+  font-size:16px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;
+  cursor:pointer;position:relative;overflow:hidden;
+  box-shadow:0 10px 40px rgba(255,140,0,.4),0 2px 12px rgba(0,0,0,.4);
+  animation:btnPulse 2.8s ease-in-out infinite;
+  transition:transform .15s ease,box-shadow .15s ease;
+}
+.btn-get::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(105deg,transparent 30%,rgba(255,255,255,.18) 50%,transparent 70%);
+  transform:translateX(-100%);animation:btnShine 3.5s ease 1.2s infinite;
+}
+@keyframes btnShine{0%{transform:translateX(-100%)}30%,100%{transform:translateX(200%)}}
+@keyframes btnPulse{0%,100%{box-shadow:0 10px 40px rgba(255,140,0,.4),0 2px 12px rgba(0,0,0,.4)}50%{box-shadow:0 14px 55px rgba(255,140,0,.62),0 4px 18px rgba(0,0,0,.4)}}
+.btn-get:active{transform:scale(.97);box-shadow:0 6px 24px rgba(255,140,0,.35)}
+
+.btn-note{
+  display:flex;align-items:center;justify-content:center;gap:6px;
+  margin-top:11px;font-size:11px;color:#3d5266;font-weight:500;line-height:1.6;text-align:center;
+}
+.bn-dot{width:4px;height:4px;border-radius:50%;background:#FF9800;opacity:.5}
+
+/* Footer */
+.ft{text-align:center;color:#1e2d3a;font-size:11px;margin-top:44px;line-height:2}
+</style>
 </head>
 <body>
-<div class="particles" id="particles"></div>
-<div class="container">
-  <div class="logo-wrap">
-    <div class="logo-circle">
-      <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M24 8L8 16V28C8 36.8 15.6 45.2 24 47C32.4 45.2 40 36.8 40 28V16L24 8Z" fill="rgba(255,255,255,.15)" stroke="#ff6666" stroke-width="1.5"/>
-        <path d="M18 24H30M24 18V30" stroke="#fff" stroke-width="2" stroke-linecap="round"/>
-      </svg>
+<div class="bg-glow"><div class="glow-1"></div><div class="glow-2"></div></div>
+<div class="pts" id="pts"></div>
+
+<div class="wrap">
+
+  <!-- Header -->
+  <div class="hdr">
+    <div class="logo-wrap">
+      <div class="logo-bg">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="11" width="18" height="11" rx="2.5"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          <circle cx="12" cy="16.5" r="1.3" fill="#fff" stroke="none"/>
+        </svg>
+      </div>
+      <div class="logo-ring"></div>
     </div>
-    <div class="brand">AUJUNPEAK</div>
-    <div class="tagline">Hệ thống kích hoạt key miễn phí</div>
+    <div class="hdr-title">LẤY KEY <em>MIỄN PHÍ</em></div>
+    <div class="hdr-sub">Xác thực thiết bị &amp; nhận key 30 phút không mất phí</div>
   </div>
 
-  <!-- CARD 1: THÔNG TIN THIẾT BỊ -->
+  <!-- Device info card -->
   <div class="card">
-    <div class="card-title">Xác thực thiết bị</div>
-    <div class="device-row">
-      <div class="device-icon">
-        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="18" r="1"/></svg>
+    <div class="card-shine"></div>
+    <div class="card-hd">Thông tin thiết bị</div>
+    <div class="dr">
+      <div class="dr-ic">
+        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2.5"/><circle cx="12" cy="17.5" r="1" fill="#FF9800" stroke="none"/></svg>
       </div>
-      <div>
-        <div class="device-label">Tên thiết bị</div>
-        <div class="device-value">${escapeHtml(deviceName)}</div>
-      </div>
-    </div>
-    <div class="device-row">
-      <div class="device-icon">
-        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-      </div>
-      <div>
-        <div class="device-label">Device ID</div>
-        <div class="device-value mono">${escapeHtml(deviceId.substring(0, 8))}****${escapeHtml(deviceId.slice(-4))}</div>
+      <div class="dr-meta">
+        <div class="dr-lbl">Tên thiết bị</div>
+        <div class="dr-val">${safeName}</div>
       </div>
     </div>
-    <div style="margin-top:12px">
-      <div class="verify-status">
-        <div class="verify-dot"></div>
-        <div class="verify-text">✓ Xác thực thiết bị thành công — Thiết bị hợp lệ</div>
+    <div class="dr">
+      <div class="dr-ic">
+        <svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      </div>
+      <div class="dr-meta">
+        <div class="dr-lbl">Device ID</div>
+        <div class="dr-val mono">${safeId}</div>
       </div>
     </div>
-    <div class="timer-badge">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-      Key Free có hiệu lực 30 phút · Chỉ dùng được trên thiết bị này
+    <div class="dr">
+      <div class="dr-ic">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+      </div>
+      <div class="dr-meta">
+        <div class="dr-lbl">Thời hạn</div>
+        <div class="dr-val">30 phút · Miễn phí · 1 thiết bị</div>
+      </div>
     </div>
   </div>
 
-  <!-- CARD 2: HƯỚNG DẪN -->
+  <!-- Verification card -->
   <div class="card">
-    <div class="card-title">Hướng dẫn lấy key</div>
+    <div class="card-shine"></div>
+    <div class="card-hd">Quy trình xác thực</div>
     <div class="steps">
-      <div class="step">
-        <div class="step-num">1</div>
-        <div class="step-text">Nhấn nút <strong>Mở Link Vượt</strong> hoặc nhấn <strong>Sao chép</strong> rồi mở link trong trình duyệt</div>
+      <div class="srow" id="sr1">
+        <div class="s-ic idle" id="ic1">
+          <svg viewBox="0 0 24 24" stroke="#334455" fill="none" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>
+        </div>
+        <div class="s-body">
+          <div class="s-name" id="sn1">Kiểm tra thiết bị</div>
+          <div class="s-desc">Xác minh thông tin phần cứng &amp; hệ điều hành</div>
+        </div>
+        <div class="s-badge" id="sb1">✓ PASS</div>
       </div>
-      <div class="step">
-        <div class="step-num">2</div>
-        <div class="step-text">Hoàn thành các bước xác minh trên trang Link4m <strong>(thường mất 10–30 giây)</strong></div>
+      <div class="srow" id="sr2">
+        <div class="s-ic idle" id="ic2">
+          <svg viewBox="0 0 24 24" stroke="#334455" fill="none" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>
+        </div>
+        <div class="s-body">
+          <div class="s-name" id="sn2">Xác minh kết nối</div>
+          <div class="s-desc">Kiểm tra kết nối tới máy chủ bảo mật</div>
+        </div>
+        <div class="s-badge" id="sb2">✓ PASS</div>
       </div>
-      <div class="step">
-        <div class="step-num">3</div>
-        <div class="step-text">Hệ thống sẽ tự động tạo key và hiển thị trên trang mới</div>
+      <div class="srow" id="sr3">
+        <div class="s-ic idle" id="ic3">
+          <svg viewBox="0 0 24 24" stroke="#334455" fill="none" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>
+        </div>
+        <div class="s-body">
+          <div class="s-name" id="sn3">Tạo link bảo mật</div>
+          <div class="s-desc">Tạo đường dẫn xác thực dành riêng cho thiết bị</div>
+        </div>
+        <div class="s-badge" id="sb3">✓ PASS</div>
       </div>
-      <div class="step">
-        <div class="step-num">4</div>
-        <div class="step-text">Sao chép key và dán vào ứng dụng Aujunpeak để kích hoạt</div>
-      </div>
-    </div>
-
-    <!-- Link4m URL -->
-    <div class="link-box" id="linkBox">
-      <div class="link-url" id="linkUrl">${escapeHtml(link4mUrl)}</div>
-      <button class="btn-copy" id="btnCopy" onclick="copyLink()">Sao chép</button>
     </div>
   </div>
 
-  <!-- NÚT MỞ LINK -->
-  <a class="btn-open" href="${escapeHtml(link4mUrl)}" target="_blank" rel="noopener">
-    🚀 &nbsp; Mở Link Vượt — Nhận Key Ngay
-  </a>
+  <!-- Get key button (ẩn cho đến khi animation xong) -->
+  <div class="btn-wrap" id="btnWrap">
+    <a class="btn-get" href="${safeUrl}" id="btnGet">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 2H3v16h5l4 4 4-4h5V2z"/>
+        <line x1="8" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="12" y2="14"/>
+      </svg>
+      NHẬN KEY NGAY
+    </a>
+    <div class="btn-note">
+      <span>Miễn phí</span><div class="bn-dot"></div>
+      <span>30 phút</span><div class="bn-dot"></div>
+      <span>1 thiết bị</span><div class="bn-dot"></div>
+      <span>Không cần đăng ký</span>
+    </div>
+  </div>
 
-  <div class="footer">Aujunpeak · Key free giới hạn 30 phút · 1 thiết bị · Miễn phí hoàn toàn</div>
+</div>
+
+<div class="ft">
+  Aujunpeak Security System · v2.0<br/>
+  Hỗ trợ qua Zalo &amp; Facebook · Liên hệ admin để nâng cấp VIP
 </div>
 
 <script>
-  // Particles
-  const c = document.getElementById('particles');
-  const COLORS = ['#ff1744','#ff5252','#ff8a80','#ff6666','#cc0022'];
-  for(let i=0;i<28;i++){
-    const p=document.createElement('div');
-    p.className='particle';
-    const size=Math.random()*5+2;
-    p.style.cssText='width:'+size+'px;height:'+size+'px;left:'+Math.random()*100+'%;background:'+COLORS[Math.floor(Math.random()*COLORS.length)]+';animation-duration:'+(Math.random()*12+8)+'s;animation-delay:-'+(Math.random()*12)+'s';
+// Particles
+(function(){
+  const c=document.getElementById('pts');
+  const CL=['#FF9800','#FFC107','#FF6D00','#FFD740','#FFAB40','#FF8F00'];
+  for(let i=0;i<22;i++){
+    const p=document.createElement('div');p.className='pt';
+    const s=Math.random()*4+1.5;
+    p.style.cssText='width:'+s+'px;height:'+s+'px;left:'+(Math.random()*100)+'%;'
+      +'background:'+CL[Math.floor(Math.random()*CL.length)]+';'
+      +'animation-duration:'+(Math.random()*14+9)+'s;'
+      +'animation-delay:-'+(Math.random()*14)+'s';
     c.appendChild(p);
   }
+})();
 
-  // Copy link
-  function copyLink(){
-    const url=document.getElementById('linkUrl').textContent;
-    navigator.clipboard.writeText(url).then(()=>{
-      const btn=document.getElementById('btnCopy');
-      btn.textContent='✓ Đã copy!';
-      btn.classList.add('copied');
-      setTimeout(()=>{btn.textContent='Sao chép';btn.classList.remove('copied');},2500);
-    }).catch(()=>{
-      const ta=document.createElement('textarea');
-      ta.value=url;ta.style.position='fixed';ta.style.opacity='0';
-      document.body.appendChild(ta);ta.focus();ta.select();
-      document.execCommand('copy');document.body.removeChild(ta);
-      const btn=document.getElementById('btnCopy');
-      btn.textContent='✓ Đã copy!';btn.classList.add('copied');
-      setTimeout(()=>{btn.textContent='Sao chép';btn.classList.remove('copied');},2500);
-    });
-  }
+// ── Verification animation ──
+function setIdle(id){
+  const el=document.getElementById(id);
+  el.className='s-ic idle';
+  el.innerHTML='<svg viewBox="0 0 24 24" stroke="#334455" fill="none" stroke-width="2"><circle cx="12" cy="12" r="4"/></svg>';
+}
+function setLoading(id){
+  const el=document.getElementById(id);
+  el.className='s-ic spin-state';
+  el.innerHTML='<svg viewBox="0 0 24 24" stroke="#FF9800" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>';
+}
+function setDone(id,nameId,badgeId){
+  const el=document.getElementById(id);
+  el.className='s-ic ok';
+  el.innerHTML='<svg viewBox="0 0 24 24" stroke="#00dd66" fill="none" stroke-width="2.8" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>';
+  const nm=document.getElementById(nameId);
+  nm.className='s-name ok-text';
+  const bd=document.getElementById(badgeId);
+  bd.className='s-badge show';
+}
+
+const SEQ=[
+  {sr:'sr1',ic:'ic1',sn:'sn1',sb:'sb1',show:120,load:480,done:1550},
+  {sr:'sr2',ic:'ic2',sn:'sn2',sb:'sb2',show:420,load:1700,done:2800},
+  {sr:'sr3',ic:'ic3',sn:'sn3',sb:'sb3',show:720,load:3000,done:4200},
+];
+SEQ.forEach(function(s){
+  setTimeout(function(){document.getElementById(s.sr).classList.add('vis');},s.show);
+  setTimeout(function(){setLoading(s.ic);},s.load);
+  setTimeout(function(){setDone(s.ic,s.sn,s.sb);},s.done);
+});
+// Show get-key button after all steps done
+setTimeout(function(){document.getElementById('btnWrap').classList.add('show');},4600);
+
+// Prevent double-click
+document.getElementById('btnGet').addEventListener('click',function(){
+  this.style.pointerEvents='none';
+  this.innerHTML='<svg width="20" height="20" viewBox="0 0 24 24" stroke="#fff" fill="none" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.2-8.56"/></svg>&nbsp; Đang mở...';
+});
 </script>
 </body>
 </html>`;
-
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(html);
 });
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // FREE KEY — TRANG THÀNH CÔNG SAU KHI VƯỢT LINK4M
@@ -457,200 +600,359 @@ router.get("/keys/free-success", async (req, res): Promise<void> => {
   const deviceName = decodeURIComponent((req.query.deviceName as string) ?? "Thiết bị của bạn");
   const remaining  = parseInt((req.query.remaining as string) ?? "30", 10) || 30;
 
-  if (!key) { res.status(400).send("Thiếu key"); return; }
+  if (!key) { res.status(400).send("<h2>Thiếu key</h2>"); return; }
+
+  const safeKey  = escapeHtml(key);
+  const safeName = escapeHtml(deviceName);
+  const safeSecs = remaining * 60;
+
+  // Tách key thành các đoạn để format đẹp
+  const parts = safeKey.split("-");
+  const keyFormatted = parts.length === 4
+    ? parts.map(p => `<span class="kp">${p}</span>`).join('<span class="ksep">-</span>')
+    : safeKey;
 
   const html = `<!DOCTYPE html>
 <html lang="vi">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Key Của Bạn — Aujunpeak</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=JetBrains+Mono:wght@700&display=swap" rel="stylesheet"/>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{min-height:100vh;background:radial-gradient(ellipse at top,#001a0f 0%,#000a05 60%,#000 100%);font-family:'Inter',sans-serif;color:#fff;overflow-x:hidden}
-    .particles{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
-    .particle{position:absolute;border-radius:50%;animation:floatUp linear infinite;opacity:0}
-    @keyframes floatUp{0%{transform:translateY(100vh) scale(0);opacity:0}10%{opacity:.6}90%{opacity:.3}100%{transform:translateY(-20vh) scale(1.2);opacity:0}}
-    .container{position:relative;z-index:1;max-width:480px;margin:0 auto;padding:24px 16px 48px}
-    .success-header{text-align:center;margin-bottom:32px;padding-top:24px}
-    .check-circle{width:100px;height:100px;border-radius:50%;background:linear-gradient(135deg,#00e676,#00c853);margin:0 auto 20px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 50px rgba(0,200,83,.5),0 0 100px rgba(0,200,83,.2);animation:successPop .6s cubic-bezier(.34,1.56,.64,1) forwards, glow 2.5s ease-in-out 1s infinite}
-    @keyframes successPop{0%{transform:scale(0) rotate(-45deg);opacity:0}80%{transform:scale(1.15) rotate(5deg)}100%{transform:scale(1) rotate(0deg);opacity:1}}
-    @keyframes glow{0%,100%{box-shadow:0 0 50px rgba(0,200,83,.5),0 0 100px rgba(0,200,83,.2)}50%{box-shadow:0 0 70px rgba(0,230,118,.7),0 0 130px rgba(0,230,118,.35)}}
-    .check-circle svg{width:52px;height:52px}
-    .success-title{font-size:26px;font-weight:900;color:#fff;margin-bottom:8px;letter-spacing:-.01em}
-    .success-sub{color:#66cc99;font-size:14px;font-weight:600}
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>Key của bạn · Aujunpeak</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&family=JetBrains+Mono:wght@600;700&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{min-height:100vh;background:#060d0a;font-family:'Inter',sans-serif;color:#fff;overflow-x:hidden}
 
-    .card{background:linear-gradient(145deg,rgba(0,230,118,.08),rgba(0,100,50,.05));border:1px solid rgba(0,230,118,.2);border-radius:20px;padding:20px;margin-bottom:16px;backdrop-filter:blur(12px);animation:slideUp .5s ease forwards;opacity:0}
-    .card:nth-child(1){animation-delay:.2s}
-    .card:nth-child(2){animation-delay:.35s}
-    .card:nth-child(3){animation-delay:.5s}
-    @keyframes slideUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
-    .card-title{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#66cc99;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-    .card-title::before{content:'';width:20px;height:2px;background:#00c853;border-radius:2px}
+.bg-glow{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
+.glow-1{position:absolute;top:-25%;left:-10%;width:60%;height:60%;
+  background:radial-gradient(circle,rgba(0,230,100,.13) 0%,transparent 70%);
+  animation:g1 10s ease-in-out infinite alternate}
+.glow-2{position:absolute;bottom:-20%;right:-15%;width:55%;height:55%;
+  background:radial-gradient(circle,rgba(0,180,80,.09) 0%,transparent 70%);
+  animation:g2 13s ease-in-out infinite alternate}
+@keyframes g1{to{transform:translate(7%,10%) scale(1.1)}}
+@keyframes g2{to{transform:translate(-6%,-7%) scale(1.15)}}
 
-    .key-display{background:rgba(0,0,0,.5);border:2px solid rgba(0,230,118,.35);border-radius:14px;padding:18px;text-align:center;margin-bottom:12px;position:relative;overflow:hidden}
-    .key-display::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(0,230,118,.06),transparent);animation:scan 3s linear infinite}
-    @keyframes scan{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
-    .key-text{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:700;color:#fff;letter-spacing:.15em;word-break:break-all;line-height:1.4}
-    .key-text .dash{color:rgba(0,230,118,.5);margin:0 2px}
+.pts{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.pt{position:absolute;border-radius:50%;animation:ptUp linear infinite;opacity:0}
+@keyframes ptUp{0%{transform:translateY(105vh) scale(0);opacity:0}8%{opacity:.5}92%{opacity:.18}100%{transform:translateY(-5vh);opacity:0}}
 
-    .btn-copy-key{width:100%;padding:14px;border-radius:12px;background:linear-gradient(135deg,#00c853,#009639);border:none;color:#fff;font-size:14px;font-weight:800;letter-spacing:.04em;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px}
-    .btn-copy-key:active{transform:scale(.98)}
-    .btn-copy-key.copied{background:linear-gradient(135deg,#667eea,#764ba2)}
+.wrap{position:relative;z-index:1;max-width:430px;margin:0 auto;padding:28px 18px 64px}
 
-    .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-    .info-item{background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px;text-align:center}
-    .info-item-label{font-size:10px;color:#779988;font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
-    .info-item-value{font-size:15px;font-weight:900;color:#fff}
-    .info-item-value.highlight{color:#00e676}
-    .info-item-value.warn{color:#ffcc02}
+/* ── Success header ── */
+.shdr{text-align:center;margin-bottom:28px}
+.chk-wrap{position:relative;width:96px;height:96px;margin:0 auto 18px}
+.chk-circle{
+  width:96px;height:96px;border-radius:50%;
+  background:linear-gradient(135deg,#00e676,#00a152);
+  display:flex;align-items:center;justify-content:center;
+  animation:chkPop .65s cubic-bezier(.34,1.56,.64,1) forwards,chkGlow 2.8s ease-in-out 1s infinite;
+  transform:scale(0);opacity:0;
+}
+@keyframes chkPop{
+  0%{transform:scale(0) rotate(-30deg);opacity:0}
+  75%{transform:scale(1.12) rotate(4deg)}
+  100%{transform:scale(1) rotate(0deg);opacity:1}
+}
+@keyframes chkGlow{
+  0%,100%{box-shadow:0 0 30px rgba(0,230,100,.45),0 0 60px rgba(0,230,100,.15)}
+  50%{box-shadow:0 0 50px rgba(0,230,100,.7),0 0 100px rgba(0,230,100,.25)}
+}
+.chk-ring{
+  position:absolute;inset:-8px;border-radius:50%;
+  border:2px solid transparent;
+  border-top:2px solid rgba(0,230,100,.6);
+  border-right:2px solid rgba(0,230,100,.2);
+  animation:spin 4s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
 
-    .timer-section{display:flex;align-items:center;gap:12px;padding:14px;background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.2);border-radius:12px}
-    .timer-icon{font-size:28px}
-    .timer-label{font-size:11px;color:#cc9900;font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
-    .timer-display{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:900;color:#ffcc02}
+.shdr-title{font-size:26px;font-weight:900;letter-spacing:-.02em;margin-bottom:8px;
+  animation:fadeUp .5s ease .7s both}
+.shdr-title em{color:#00e676;font-style:normal}
+.shdr-sub{font-size:13px;color:#4a7a5a;font-weight:500;animation:fadeUp .5s ease .85s both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
 
-    .steps-use{display:flex;flex-direction:column;gap:10px}
-    .step-use{display:flex;align-items:flex-start;gap:10px;font-size:13px;color:#aabbcc;line-height:1.5}
-    .step-use strong{color:#fff}
-    .step-badge{width:24px;height:24px;border-radius:50%;background:rgba(0,200,83,.15);border:1px solid rgba(0,200,83,.3);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;color:#00c853;flex-shrink:0;margin-top:1px}
+/* ── Cards ── */
+.card{
+  background:linear-gradient(145deg,rgba(0,230,100,.07),rgba(8,16,12,.75));
+  border:1px solid rgba(0,230,100,.16);
+  border-radius:22px;padding:20px;margin-bottom:14px;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  overflow:hidden;position:relative;
+  animation:cardIn .45s ease both;
+}
+.card:nth-child(1){animation-delay:.3s}
+.card:nth-child(2){animation-delay:.45s}
+.card:nth-child(3){animation-delay:.6s}
+@keyframes cardIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.card-shine{
+  position:absolute;top:0;left:-120%;width:60%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.04),transparent);
+  animation:cshine 7s linear infinite;
+}
+@keyframes cshine{to{left:160%}}
+.card-hd{font-size:10.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;
+  color:#00c853;opacity:.9;margin-bottom:16px;display:flex;align-items:center;gap:7px}
+.card-hd::before{content:'';width:18px;height:2px;background:#00c853;border-radius:2px}
 
-    .footer{text-align:center;color:#334455;font-size:11px;margin-top:32px;line-height:1.8}
-  </style>
+/* Device row in success */
+.drow{display:flex;align-items:center;gap:12px}
+.d-ic{width:40px;height:40px;border-radius:12px;background:rgba(0,200,80,.1);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.d-ic svg{width:20px;height:20px;stroke:#00c853;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.d-lbl{font-size:10px;color:#3a5a44;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:4px}
+.d-val{font-size:14px;color:#d0eedd;font-weight:700}
+
+/* Key display */
+.key-box{
+  background:rgba(0,0,0,.45);border:2px solid rgba(0,230,100,.28);
+  border-radius:16px;padding:20px 16px;text-align:center;
+  margin-bottom:14px;position:relative;overflow:hidden;
+}
+.key-box::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(0,230,100,.06),transparent);
+  animation:scan 3s linear infinite;
+}
+@keyframes scan{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+.key-lbl{font-size:10px;font-weight:700;letter-spacing:.12em;color:#3d7a52;
+  text-transform:uppercase;margin-bottom:12px}
+.key-text{
+  font-family:'JetBrains Mono',monospace;
+  font-size:22px;font-weight:700;letter-spacing:.12em;
+  color:#fff;line-height:1.3;
+}
+.kp{color:#fff}
+.ksep{color:rgba(0,230,100,.45);margin:0 1px}
+
+.btn-copy{
+  width:100%;padding:14px 20px;border-radius:14px;
+  background:linear-gradient(135deg,#00c853,#008c3a);border:none;
+  color:#fff;font-size:14px;font-weight:800;letter-spacing:.04em;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;gap:9px;
+  transition:all .2s ease;box-shadow:0 6px 24px rgba(0,200,80,.35);
+}
+.btn-copy:active{transform:scale(.97);box-shadow:0 3px 14px rgba(0,200,80,.25)}
+.btn-copy.done-state{background:linear-gradient(135deg,#667eea,#764ba2);box-shadow:0 6px 24px rgba(102,126,234,.35)}
+
+/* Timer card */
+.timer-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.timer-info{flex:1}
+.timer-lbl{font-size:10px;color:#3a5a44;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px}
+.timer-val{font-family:'JetBrains Mono',monospace;font-size:30px;font-weight:700;color:#00e676;letter-spacing:.08em;transition:color .3s}
+.timer-val.warn{color:#FFC107}
+.timer-val.danger{color:#FF5252;animation:timerBlink 1s ease-in-out infinite}
+@keyframes timerBlink{0%,100%{opacity:1}50%{opacity:.5}}
+.timer-ic{width:52px;height:52px;border-radius:50%;background:rgba(0,230,100,.1);
+  border:2px solid rgba(0,230,100,.2);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.timer-ic svg{width:26px;height:26px;stroke:#00c853;fill:none;stroke-width:2;stroke-linecap:round}
+.timer-note{font-size:11px;color:#2d4a36;margin-top:8px;font-weight:500;line-height:1.6}
+
+/* Progress bar */
+.prog-wrap{margin-top:12px;height:4px;background:rgba(255,255,255,.06);border-radius:4px;overflow:hidden}
+.prog-bar{height:100%;background:linear-gradient(90deg,#00e676,#00c853);border-radius:4px;
+  transition:width 1s linear,background .5s ease;width:100%}
+
+/* Instructions */
+.steps-use{display:flex;flex-direction:column;gap:12px}
+.step-use{display:flex;align-items:flex-start;gap:13px}
+.su-num{
+  width:26px;height:26px;border-radius:50%;flex-shrink:0;
+  background:linear-gradient(135deg,#00c853,#008c3a);
+  display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:900;margin-top:1px;
+}
+.su-text{font-size:13px;color:#88aabb;line-height:1.55;font-weight:500}
+.su-text strong{color:#b8d8cc;font-weight:700}
+
+/* Expired overlay */
+.expired-msg{display:none;text-align:center;padding:18px;background:rgba(255,50,50,.08);
+  border:1px solid rgba(255,50,50,.2);border-radius:14px;margin-top:4px}
+.expired-msg.show{display:block}
+.expired-ic{font-size:36px;margin-bottom:8px}
+.expired-t{font-size:15px;font-weight:800;color:#ff5252;margin-bottom:6px}
+.expired-s{font-size:12px;color:#886666;line-height:1.5}
+
+.ft{text-align:center;color:#1a2d24;font-size:11px;margin-top:44px;line-height:2}
+</style>
 </head>
 <body>
-<div class="particles" id="particles"></div>
-<div class="container">
+<div class="bg-glow"><div class="glow-1"></div><div class="glow-2"></div></div>
+<div class="pts" id="pts"></div>
+<div class="wrap">
 
-  <div class="success-header">
-    <div class="check-circle">
-      <svg viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M14 27L22 35L38 17" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
+  <!-- Success header -->
+  <div class="shdr">
+    <div class="chk-wrap">
+      <div class="chk-circle">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+      </div>
+      <div class="chk-ring"></div>
     </div>
-    <div class="success-title">Key Đã Được Tạo! 🎉</div>
-    <div class="success-sub">Sao chép key và kích hoạt ngay trong ứng dụng</div>
+    <div class="shdr-title">KEY <em>ĐÃ SẴN SÀNG!</em></div>
+    <div class="shdr-sub">Sao chép key và dán vào ứng dụng Aujunpeak</div>
   </div>
 
-  <!-- CARD 1: KEY -->
+  <!-- Device info -->
   <div class="card">
-    <div class="card-title">Key Kích Hoạt Của Bạn</div>
-    <div class="key-display">
-      <div class="key-text" id="keyText">${escapeHtml(key)}</div>
+    <div class="card-shine"></div>
+    <div class="card-hd">Thiết bị được cấp key</div>
+    <div class="drow">
+      <div class="d-ic">
+        <svg viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="2.5"/>
+          <circle cx="12" cy="17.5" r="1" fill="#00c853" stroke="none"/></svg>
+      </div>
+      <div>
+        <div class="d-lbl">Thiết bị</div>
+        <div class="d-val">${safeName}</div>
+      </div>
     </div>
-    <button class="btn-copy-key" id="btnCopyKey" onclick="copyKey()">
+  </div>
+
+  <!-- Key display -->
+  <div class="card">
+    <div class="card-shine"></div>
+    <div class="card-hd">Key kích hoạt của bạn</div>
+    <div class="key-box">
+      <div class="key-lbl">🔑 Key kích hoạt · Miễn phí</div>
+      <div class="key-text" id="keyText">${keyFormatted}</div>
+    </div>
+    <button class="btn-copy" id="btnCopy" onclick="copyKey()">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
       </svg>
       Sao Chép Key
     </button>
   </div>
 
-  <!-- CARD 2: THÔNG TIN KEY -->
-  <div class="card">
-    <div class="card-title">Thông tin key</div>
-    <div class="info-grid">
-      <div class="info-item">
-        <div class="info-item-label">Loại Key</div>
-        <div class="info-item-value highlight">FREE</div>
+  <!-- Countdown timer -->
+  <div class="card" id="timerCard">
+    <div class="card-shine"></div>
+    <div class="card-hd">Thời hạn sử dụng</div>
+    <div class="timer-row">
+      <div class="timer-info">
+        <div class="timer-lbl">Hết hạn sau</div>
+        <div class="timer-val" id="timerDisplay">30:00</div>
+        <div class="timer-note">Key chỉ hoạt động trên thiết bị này · Không thể gia hạn</div>
       </div>
-      <div class="info-item">
-        <div class="info-item-label">Số thiết bị</div>
-        <div class="info-item-value">1 / 1</div>
-      </div>
-      <div class="info-item">
-        <div class="info-item-label">Hiệu lực</div>
-        <div class="info-item-value warn">${remaining} phút</div>
-      </div>
-      <div class="info-item">
-        <div class="info-item-label">Thiết bị</div>
-        <div class="info-item-value" style="font-size:11px;padding-top:4px">${escapeHtml(deviceName.length > 14 ? deviceName.substring(0,13)+"…" : deviceName)}</div>
+      <div class="timer-ic">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
       </div>
     </div>
-
-    <div class="timer-section" style="margin-top:14px">
-      <div class="timer-icon">⏱</div>
-      <div>
-        <div class="timer-label">Thời gian còn lại</div>
-        <div class="timer-display" id="timerDisplay">--:--</div>
-      </div>
-    </div>
+    <div class="prog-wrap"><div class="prog-bar" id="progBar"></div></div>
   </div>
 
-  <!-- CARD 3: HƯỚNG DẪN SỬ DỤNG -->
+  <!-- Instructions -->
   <div class="card">
-    <div class="card-title">Cách sử dụng</div>
+    <div class="card-shine"></div>
+    <div class="card-hd">Cách sử dụng key</div>
     <div class="steps-use">
-      <div class="step-use"><div class="step-badge">1</div>Nhấn <strong>Sao chép key</strong> bên trên</div>
-      <div class="step-use"><div class="step-badge">2</div>Mở ứng dụng <strong>Aujunpeak</strong> trên điện thoại</div>
-      <div class="step-use"><div class="step-badge">3</div>Dán key vào ô <strong>Nhập key kích hoạt</strong></div>
-      <div class="step-use"><div class="step-badge">4</div>Nhấn <strong>START KEY</strong> để kích hoạt</div>
+      <div class="step-use">
+        <div class="su-num">1</div>
+        <div class="su-text">Nhấn nút <strong>Sao Chép Key</strong> bên trên</div>
+      </div>
+      <div class="step-use">
+        <div class="su-num">2</div>
+        <div class="su-text">Mở ứng dụng <strong>Aujunpeak</strong> trên điện thoại</div>
+      </div>
+      <div class="step-use">
+        <div class="su-num">3</div>
+        <div class="su-text">Dán key vào ô <strong>Nhập key kích hoạt</strong></div>
+      </div>
+      <div class="step-use">
+        <div class="su-num">4</div>
+        <div class="su-text">Nhấn nút <strong>START KEY</strong> để kích hoạt ngay</div>
+      </div>
     </div>
   </div>
 
-  <div class="footer">
-    Aujunpeak · Key Free · Giới hạn 30 phút · Chỉ dùng trên 1 thiết bị<br/>
-    Muốn key dài hơn? Liên hệ admin để nâng cấp VIP
+  <div class="expired-msg" id="expiredMsg">
+    <div class="expired-ic">⏰</div>
+    <div class="expired-t">Key đã hết hạn</div>
+    <div class="expired-s">Nhấn GET KEY FREE trong app để lấy key mới</div>
   </div>
+
+</div>
+
+<div class="ft">
+  Aujunpeak · Key Free · 30 phút · 1 thiết bị<br/>
+  Nâng cấp VIP để dùng không giới hạn · Liên hệ admin
 </div>
 
 <script>
-  // Particles
-  const c = document.getElementById('particles');
-  const COLORS = ['#00e676','#00c853','#69ff47','#b9f6ca','#00e676'];
-  for(let i=0;i<28;i++){
-    const p=document.createElement('div');
-    p.className='particle';
-    const size=Math.random()*5+2;
-    p.style.cssText='width:'+size+'px;height:'+size+'px;left:'+Math.random()*100+'%;background:'+COLORS[Math.floor(Math.random()*COLORS.length)]+';animation-duration:'+(Math.random()*12+8)+'s;animation-delay:-'+(Math.random()*12)+'s';
+// Particles
+(function(){
+  const c=document.getElementById('pts');
+  const CL=['#00e676','#00c853','#69ff47','#b9f6ca','#00e676','#1de9b6'];
+  for(let i=0;i<24;i++){
+    const p=document.createElement('div');p.className='pt';
+    const s=Math.random()*4+1.5;
+    p.style.cssText='width:'+s+'px;height:'+s+'px;left:'+(Math.random()*100)+'%;'
+      +'background:'+CL[Math.floor(Math.random()*CL.length)]+';'
+      +'animation-duration:'+(Math.random()*14+9)+'s;'
+      +'animation-delay:-'+(Math.random()*14)+'s';
     c.appendChild(p);
   }
+})();
 
-  // Copy key
-  function copyKey(){
-    const key = document.getElementById('keyText').textContent;
-    navigator.clipboard.writeText(key).then(()=>{showCopied();}).catch(()=>{
-      const ta=document.createElement('textarea');
-      ta.value=key;ta.style.position='fixed';ta.style.opacity='0';
-      document.body.appendChild(ta);ta.focus();ta.select();
-      document.execCommand('copy');document.body.removeChild(ta);
-      showCopied();
-    });
-  }
-  function showCopied(){
-    const btn=document.getElementById('btnCopyKey');
-    btn.innerHTML='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg> ✓ Đã sao chép!';
-    btn.classList.add('copied');
-    setTimeout(()=>{
-      btn.innerHTML='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg> Sao Chép Key';
-      btn.classList.remove('copied');
+// Copy key
+function copyKey(){
+  const raw='${safeKey}';
+  const btn=document.getElementById('btnCopy');
+  navigator.clipboard.writeText(raw).then(ok).catch(function(){
+    const ta=document.createElement('textarea');
+    ta.value=raw;ta.style.cssText='position:fixed;opacity:0;top:0;left:0';
+    document.body.appendChild(ta);ta.focus();ta.select();
+    document.execCommand('copy');document.body.removeChild(ta);ok();
+  });
+  function ok(){
+    btn.className='btn-copy done-state';
+    btn.innerHTML='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg> ✓ Đã sao chép!';
+    setTimeout(function(){
+      btn.className='btn-copy';
+      btn.innerHTML='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Sao Chép Key';
     },3000);
   }
+}
 
-  // Countdown timer
-  let secs = ${remaining} * 60;
-  function updateTimer(){
-    const m = Math.floor(secs/60);
-    const s = secs % 60;
-    document.getElementById('timerDisplay').textContent =
-      (m<10?'0':'')+m+':'+(s<10?'0':'')+s;
-    if(secs<=0){
-      document.getElementById('timerDisplay').textContent='HẾT HẠN';
-      document.getElementById('timerDisplay').style.color='#ff4466';
-      return;
-    }
-    secs--;
-    setTimeout(updateTimer, 1000);
+// Countdown timer
+var total=${safeSecs}, left=${safeSecs};
+var prog=document.getElementById('progBar');
+var disp=document.getElementById('timerDisplay');
+var expMsg=document.getElementById('expiredMsg');
+var timerCard=document.getElementById('timerCard');
+function tick(){
+  if(left<=0){
+    disp.textContent='HẾT HẠN';
+    disp.className='timer-val danger';
+    prog.style.width='0%';
+    prog.style.background='#ff5252';
+    expMsg.className='expired-msg show';
+    return;
   }
-  updateTimer();
+  left--;
+  var m=Math.floor(left/60), s=left%60;
+  disp.textContent=(m<10?'0':'')+m+':'+(s<10?'0':'')+s;
+  prog.style.width=((left/total)*100).toFixed(2)+'%';
+  if(left<=300){
+    disp.className='timer-val danger';
+    prog.style.background='#ff5252';
+  } else if(left<=600){
+    disp.className='timer-val warn';
+    prog.style.background='#FFC107';
+  }
+}
+setInterval(tick,1000);
 </script>
 </body>
 </html>`;
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Content-Type","text/html; charset=utf-8");
   res.send(html);
 });
+
 
 // ── HTML escape helper ─────────────────────────────────────────────────────
 function escapeHtml(s: string): string {
