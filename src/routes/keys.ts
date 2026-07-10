@@ -144,7 +144,9 @@ router.get("/keys/free-success", (req, res): void => {
 .box{text-align:center;padding:32px}.t{font-size:22px;font-weight:900;color:#00e676;margin-bottom:8px}.s{color:#4a7a5a;font-size:14px}</style></head>
 <body><div class="box"><div class="t">✅ Key đã được tạo thành công!</div><div class="s">Vui lòng mở lại trang lấy key từ ứng dụng.</div></div></body></html>`);
   }
-});════════════════════════════════════════════════════════════════════════════
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // GENERATE FREE LINK — App gọi để nhận URL Link4m
 // POST /api/keys/generate-free-link
 // Body: { deviceId: string, deviceName: string }
