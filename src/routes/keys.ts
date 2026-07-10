@@ -55,7 +55,7 @@ function createLink4mUrl(targetUrl: string): Promise<string> {
     return Promise.reject(new Error("LINK4M_API_TOKEN không được cấu hình. Vui lòng thêm biến môi trường."));
   }
     const encoded = encodeURIComponent(targetUrl);
-    const apiUrl  = `https://link4m.com/api?api=${LINK4M_API_TOKEN}&url=${encoded}&format=json`;
+    const apiUrl  = `https://link4m.co/api-shorten/v2?api=${LINK4M_API_TOKEN}&url=${encoded}`;
 
     const mod = apiUrl.startsWith("https") ? https : http;
     const req = mod.get(apiUrl, (res) => {
