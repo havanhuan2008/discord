@@ -96,6 +96,47 @@ async function getPendingNotifications(deviceId: string) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// GENERATE FREE LINK — App gọi để nhận URL Link4m
+// POST /api/keys/generate-free-link
+// Body: { deviceId: string, deviceName: string }
+// Returns: { link4mUrl: string } | { error: string }
+// ═════════════════════════════════════════════════════════════════════════════
+router.post("/keys/generate-free-link", async (req, res): Promise<void> => {
+  const { deviceId, deviceName } = req.body ?? {};
+
+  if (!deviceId || typeof deviceId !== "string") {
+    res.status(400).json({ error: "Thiếu deviceId" });
+    return;
+  }
+
+  // Tạo claim token
+  const token = generateToken();
+  claimTokens.set(token, {
+    deviceId,
+    deviceName: deviceName ?? "Unknown Device",
+    createdAt: Date.now(),
+    used: false,
+  });
+
+  // Build claim URL (đích mà Link4m redirect đến sau khi bypass)
+  const claimUrl =
+    `${API_BASE_URL}/api/keys/claim-free` +
+    `?deviceId=${encodeURIComponent(deviceId)}` +
+    `&deviceName=${encodeURIComponent(deviceName ?? "Unknown")}` +
+    `&token=${encodeURIComponent(token)}`;
+
+  try {
+    const link4mUrl = await createLink4mUrl(claimUrl);
+    logger.info(`[FREE-LINK] Generated Link4m URL for device ${deviceId}`);
+    res.json({ link4mUrl });
+  } catch (err) {
+    logger.warn(`[FREE-LINK] Link4m failed: ${err}. Returning direct claim URL.`);
+    // Fallback: trả về trực tiếp claim URL nếu Link4m lỗi
+    res.json({ link4mUrl: claimUrl, fallback: true });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // FREE KEY — TRANG XÁC THỰC THIẾT BỊ (mở trong trình duyệt)
 // GET /api/keys/get-free-page?deviceId=XXX&deviceName=XXX
 // ═════════════════════════════════════════════════════════════════════════════
