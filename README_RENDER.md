@@ -71,6 +71,7 @@
    | `LINK4M_API_TOKEN` | Token API Link4m — mặc định `69b825a52226d2546845d241` |
    | `API_BASE_URL` | URL deploy của API (VD: `https://aujunpeak-api.onrender.com`) |
    | `NODE_ENV` | `production` |
+   | `DISCORD_LOG_CHANNEL_ID` | ID kênh Discord để nhận thông báo tự động (tùy chọn) |
 
 5. Nhấn **Create Web Service** → đợi build xong (~2-3 phút)
 
@@ -144,3 +145,25 @@ aujunpeak-api/
 ├── package.json
 └── tsconfig.json
 ```
+
+
+---
+
+## Tính năng thông báo tự động Discord (mới)
+
+Bot sẽ tự động gửi embed thông báo vào kênh `DISCORD_LOG_CHANNEL_ID` khi có các sự kiện:
+
+| Sự kiện | Thông tin gửi kèm |
+|---------|-------------------|
+| 🎁 **Key miễn phí tạo thành công** (người dùng vượt Link4m) | Key, thiết bị, OS, SDK, hết hạn |
+| 🔑 **Đăng nhập key** (từ app Android) | Key, tier, thiết bị, OS, SDK, RAM, có phải thiết bị mới |
+| 🟢 **Thiết bị online** (heartbeat sau khi offline > 8 phút) | Key, tier, thiết bị, OS, SDK, RAM |
+| 🔴 **Thiết bị offline** (đăng xuất khỏi app) | Key, tier, thiết bị, OS, SDK, RAM |
+| ⛔ **Key hết hạn** (phát hiện qua heartbeat) | Key, thiết bị |
+| 🔒 **Key bị thu hồi** (phát hiện qua heartbeat) | Key, thiết bị |
+
+**Cấu hình:** Thêm biến môi trường `DISCORD_LOG_CHANNEL_ID` = ID kênh Discord cần nhận thông báo.  
+Bot phải có quyền **Send Messages** + **Embed Links** trong kênh đó.  
+Nếu không đặt biến này, mọi thứ vẫn hoạt động bình thường (chỉ tắt log channel).
+
+**Lấy Channel ID:** Bật Developer Mode trong Discord → chuột phải vào kênh → Copy ID.

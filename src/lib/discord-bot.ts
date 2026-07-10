@@ -1003,3 +1003,124 @@ export async function startDiscordBot(): Promise<void> {
 
   await client.login(TOKEN);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// DISCORD LOG CHANNEL — gửi thông báo tự động về kênh server
+// ════════════════════════════════════════════════════════════════════════════
+
+const LOG_CHANNEL_ID = process.env.DISCORD_LOG_CHANNEL_ID ?? "";
+
+// Singleton REST client dùng riêng cho log channel (tách biệt với bot slash-command)
+let _logRest: REST | null = null;
+function getLogRest(): REST | null {
+  if (!TOKEN || !LOG_CHANNEL_ID) return null;
+  if (!_logRest) _logRest = new REST({ version: "10" }).setToken(TOKEN);
+  return _logRest;
+}
+
+export type DiscordLogEvent =
+  | "KEY_FREE_CREATED"   // Web tạo key free thành công (claim-free)
+  | "KEY_LOGIN"          // App đăng nhập key (validate)
+  | "KEY_ONLINE"         // Thiết bị vừa online (heartbeat sau offline)
+  | "KEY_OFFLINE"        // Thiết bị logout
+  | "KEY_EXPIRED_HB"     // Key hết hạn được phát hiện qua heartbeat
+  | "KEY_REVOKED_HB";    // Key bị thu hồi được phát hiện qua heartbeat
+
+export interface DiscordLogPayload {
+  event:        DiscordLogEvent;
+  key?:         string;
+  tier?:        string;
+  deviceName?:  string;
+  deviceId?:    string;
+  deviceOs?:    string;
+  deviceSdk?:   string | number;
+  deviceRam?:   string;
+  expiresAt?:   Date | null;
+  isNewDevice?: boolean;
+  label?:       string;
+  note?:        string;
+}
+
+function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: string } {
+  switch (ev) {
+    case "KEY_FREE_CREATED": return { color: 0x00C853, icon: "🎁", title: "Key Miễn Phí Đã Tạo" };
+    case "KEY_LOGIN":        return { color: 0x2196F3, icon: "🔑", title: "Đăng Nhập Key" };
+    case "KEY_ONLINE":       return { color: 0x00BFA5, icon: "🟢", title: "Thiết Bị Online" };
+    case "KEY_OFFLINE":      return { color: 0x607D8B, icon: "🔴", title: "Thiết Bị Offline" };
+    case "KEY_EXPIRED_HB":   return { color: 0xFF5722, icon: "⛔", title: "Key Hết Hạn (Phát Hiện)" };
+    case "KEY_REVOKED_HB":   return { color: 0xF44336, icon: "🔒", title: "Key Bị Thu Hồi (Phát Hiện)" };
+  }
+}
+
+function _fmtDate(d: Date | null | undefined): string {
+  if (!d) return "Không giới hạn";
+  return d.toLocaleDateString("vi-VN", {
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+}
+
+/**
+ * Gửi embed thông báo tự động vào kênh DISCORD_LOG_CHANNEL_ID.
+ * Hàm không ném lỗi — lỗi chỉ được log ra console.
+ */
+export async function sendDiscordLog(payload: DiscordLogPayload): Promise<void> {
+  const rest = getLogRest();
+  if (!rest) return; // chưa cấu hình → bỏ qua
+
+  const meta = _evMeta(payload.event);
+
+  const fields: { name: string; value: string; inline: boolean }[] = [];
+
+  if (payload.key) {
+    fields.push({ name: "🗝️ Key", value: `\`${payload.key}\``, inline: false });
+  }
+  if (payload.tier) {
+    const tierLabel = payload.tier === "vip" ? "👑 VIP" : "🆓 FREE";
+    fields.push({ name: "⭐ Tier", value: tierLabel, inline: true });
+  }
+  if (payload.label) {
+    fields.push({ name: "🏷️ Nhãn", value: payload.label, inline: true });
+  }
+  if (payload.deviceName) {
+    fields.push({ name: "📱 Thiết bị", value: payload.deviceName, inline: true });
+  }
+  if (payload.deviceId) {
+    const shortId = payload.deviceId.length > 22
+      ? payload.deviceId.substring(0, 22) + "…"
+      : payload.deviceId;
+    fields.push({ name: "🆔 Device ID", value: `\`${shortId}\``, inline: false });
+  }
+  if (payload.deviceOs) {
+    const osStr = `${payload.deviceOs}${payload.deviceSdk ? ` (SDK ${payload.deviceSdk})` : ""}`;
+    fields.push({ name: "🤖 Hệ điều hành", value: osStr, inline: true });
+  }
+  if (payload.deviceRam) {
+    fields.push({ name: "🧠 RAM", value: payload.deviceRam, inline: true });
+  }
+  if (payload.expiresAt !== undefined) {
+    fields.push({ name: "⏰ Hết hạn", value: _fmtDate(payload.expiresAt), inline: true });
+  }
+  if (payload.isNewDevice !== undefined) {
+    fields.push({ name: "🆕 Thiết bị mới", value: payload.isNewDevice ? "✅ Có" : "❌ Không", inline: true });
+  }
+  if (payload.note) {
+    fields.push({ name: "📝 Ghi chú", value: payload.note, inline: false });
+  }
+
+  const embed = {
+    color:     meta.color,
+    title:     `${meta.icon} ${meta.title}`,
+    fields,
+    timestamp: new Date().toISOString(),
+    footer:    { text: "Aujunpeak Monitor" },
+  };
+
+  try {
+    await rest.post(Routes.channelMessages(LOG_CHANNEL_ID) as `/${string}`, {
+      body: { embeds: [embed] },
+    });
+  } catch (err) {
+    logger.warn({ err }, "sendDiscordLog: failed to post to log channel");
+  }
+}

@@ -2,6 +2,7 @@ import { Router, type IRouter } from "express";
 import { eq, and, sql, inArray } from "drizzle-orm";
 import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable } from "../db";
 import { logger } from "../lib/logger";
+import { sendDiscordLog } from "../lib/discord-bot";
 import https from "https";
 import http from "http";
 
@@ -47,6 +48,21 @@ setInterval(() => {
     if (now - rec.createdAt > 60 * 60 * 1000) claimTokens.delete(token);
   }
 }, 10 * 60 * 1000);
+
+// ── In-memory online tracker — theo dõi trạng thái thiết bị ────────────────
+// Key: deviceId, Value: { lastSeen: timestamp, key: keyStr, tier: string, deviceName: string }
+interface OnlineRecord {
+  lastSeen:   number;
+  key:        string;
+  tier:       string;
+  deviceName: string;
+  deviceOs:   string;
+  deviceSdk:  number;
+  deviceRam:  string;
+}
+const deviceOnlineMap = new Map<string, OnlineRecord>();
+// Thiết bị bị coi là offline nếu không heartbeat trong 8 phút (>= 2 chu kỳ foreground)
+const OFFLINE_THRESHOLD_MS = 8 * 60 * 1000;
 
 // ── Link4m helper ────────────────────────────────────────────────────────
 function createLink4mUrl(targetUrl: string): Promise<string> {
@@ -588,6 +604,18 @@ router.get("/keys/claim-free", async (req, res): Promise<void> => {
 
   req.log.info({ key: newKey, deviceId }, "Free key created via Link4m");
 
+  // Gửi thông báo Discord về key vừa tạo
+  sendDiscordLog({
+    event:      "KEY_FREE_CREATED",
+    key:        newKey,
+    tier:       "free",
+    deviceName: deviceName,
+    deviceId:   deviceId,
+    expiresAt:  expiresAt,
+    label:      `Free · ${deviceName}`,
+    note:       "Key miễn phí 30 phút — tự động tạo qua Link4m",
+  }).catch(() => {});
+
   res.redirect(`${API_BASE_URL}/api/keys/free-success?key=${encodeURIComponent(newKey)}&deviceName=${encodeURIComponent(deviceName)}&remaining=30`);
 });
 
@@ -961,7 +989,7 @@ function escapeHtml(s: string): string {
 
 // ── Validate key ─────────────────────────────────────────────────────────────
 router.post("/keys/validate", async (req, res): Promise<void> => {
-  const { key, deviceId, deviceName } = req.body;
+  const { key, deviceId, deviceName, deviceOs, deviceSdk, deviceRam } = req.body;
   if (!key || !deviceId) {
     res.status(400).json({ ok: false, message: "Thiếu key hoặc deviceId" });
     return;
@@ -993,14 +1021,23 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
       return;
     }
     await db.insert(devicesTable).values({
-      keyId: record.id,
+      keyId:      record.id,
       deviceId,
       deviceName: deviceName ?? "Unknown",
-      lastSeen: new Date(),
+      deviceOs:   deviceOs   ?? "",
+      deviceSdk:  Number(deviceSdk  ?? 0),
+      deviceRam:  deviceRam  ?? "",
+      lastSeen:   new Date(),
     });
   } else {
     await db.update(devicesTable)
-      .set({ lastSeen: new Date(), deviceName: deviceName ?? thisDevice.deviceName })
+      .set({
+        lastSeen:   new Date(),
+        deviceName: deviceName ?? thisDevice.deviceName,
+        deviceOs:   deviceOs   ?? thisDevice.deviceOs   ?? "",
+        deviceSdk:  Number(deviceSdk  ?? thisDevice.deviceSdk ?? 0),
+        deviceRam:  deviceRam  ?? thisDevice.deviceRam  ?? "",
+      })
       .where(eq(devicesTable.id, thisDevice.id));
   }
 
@@ -1010,6 +1047,23 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
     : null;
 
   req.log.info({ key: record.key }, "Key validated successfully");
+
+  // Gửi thông báo Discord khi ai đó đăng nhập key
+  sendDiscordLog({
+    event:      "KEY_LOGIN",
+    key:        record.key,
+    tier:       record.tier,
+    deviceName: deviceName ?? "Unknown",
+    deviceId:   deviceId,
+    deviceOs:   deviceOs ?? "",
+    deviceSdk:  Number(deviceSdk ?? 0),
+    deviceRam:  deviceRam ?? "",
+    expiresAt:  expiresAt,
+    isNewDevice: !thisDevice,
+    label:      record.label,
+    note:       record.note,
+  }).catch(() => {});
+
   res.json({
     ok: true,
     key: record.key,
@@ -1025,7 +1079,7 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
 
 // ── Heartbeat ────────────────────────────────────────────────────────────────
 router.post("/keys/heartbeat", async (req, res): Promise<void> => {
-  const { key, deviceId } = req.body;
+  const { key, deviceId, deviceOs, deviceSdk, deviceRam, deviceName: hbDeviceName } = req.body;
   if (!key || !deviceId) {
     res.status(400).json({ ok: false });
     return;
@@ -1033,16 +1087,94 @@ router.post("/keys/heartbeat", async (req, res): Promise<void> => {
 
   const [record] = await db.select().from(keysTable).where(eq(keysTable.key, key));
   if (!record || !record.isActive) {
+    // Thiết bị bị thu hồi — gửi thông báo Discord và xóa khỏi online map
+    const prevRec = deviceOnlineMap.get(deviceId);
+    if (prevRec) {
+      deviceOnlineMap.delete(deviceId);
+      sendDiscordLog({
+        event:      "KEY_REVOKED_HB",
+        key:        prevRec.key,
+        tier:       prevRec.tier,
+        deviceName: prevRec.deviceName,
+        deviceId:   deviceId,
+        deviceOs:   prevRec.deviceOs,
+        deviceSdk:  prevRec.deviceSdk,
+        deviceRam:  prevRec.deviceRam,
+      }).catch(() => {});
+    }
     res.json({ ok: false, revoked: true });
     return;
   }
   if (record.expiresAt && new Date() > record.expiresAt) {
+    // Key hết hạn — gửi thông báo Discord và xóa khỏi online map
+    const prevRec = deviceOnlineMap.get(deviceId);
+    if (prevRec) {
+      deviceOnlineMap.delete(deviceId);
+      sendDiscordLog({
+        event:      "KEY_EXPIRED_HB",
+        key:        prevRec.key,
+        tier:       prevRec.tier,
+        deviceName: prevRec.deviceName,
+        deviceId:   deviceId,
+        deviceOs:   prevRec.deviceOs,
+        deviceSdk:  prevRec.deviceSdk,
+        deviceRam:  prevRec.deviceRam,
+        expiresAt:  record.expiresAt,
+      }).catch(() => {});
+    }
     res.json({ ok: false, expired: true });
     return;
   }
 
+  // Lấy thông tin thiết bị hiện tại để bổ sung vào online map
+  const [deviceRow] = await db.select().from(devicesTable)
+    .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
+
+  const currentDeviceName = hbDeviceName ?? deviceRow?.deviceName ?? "Unknown";
+  const currentDeviceOs   = deviceOs ?? deviceRow?.deviceOs ?? "";
+  const currentDeviceSdk  = Number(deviceSdk ?? deviceRow?.deviceSdk ?? 0);
+  const currentDeviceRam  = deviceRam ?? deviceRow?.deviceRam ?? "";
+
+  // Kiểm tra trạng thái online/offline
+  const prevOnline = deviceOnlineMap.get(deviceId);
+  const wasOnline  = prevOnline && (Date.now() - prevOnline.lastSeen < OFFLINE_THRESHOLD_MS);
+
+  // Cập nhật online map
+  deviceOnlineMap.set(deviceId, {
+    lastSeen:   Date.now(),
+    key:        record.key,
+    tier:       record.tier,
+    deviceName: currentDeviceName,
+    deviceOs:   currentDeviceOs,
+    deviceSdk:  currentDeviceSdk,
+    deviceRam:  currentDeviceRam,
+  });
+
+  // Gửi thông báo Discord khi thiết bị vừa online (lần đầu hoặc sau khi offline)
+  if (!wasOnline) {
+    sendDiscordLog({
+      event:      "KEY_ONLINE",
+      key:        record.key,
+      tier:       record.tier,
+      deviceName: currentDeviceName,
+      deviceId:   deviceId,
+      deviceOs:   currentDeviceOs,
+      deviceSdk:  currentDeviceSdk,
+      deviceRam:  currentDeviceRam,
+      expiresAt:  record.expiresAt,
+      label:      record.label,
+    }).catch(() => {});
+  }
+
+  // Cập nhật lastSeen + device info trong DB
   await db.update(devicesTable)
-    .set({ lastSeen: new Date() })
+    .set({
+      lastSeen:   new Date(),
+      deviceName: currentDeviceName,
+      deviceOs:   currentDeviceOs,
+      deviceSdk:  currentDeviceSdk,
+      deviceRam:  currentDeviceRam,
+    })
     .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
 
   // Lấy thông báo chưa đọc + danh sách id còn tồn tại (để client dọn thông báo đã bị xoá)
@@ -1094,8 +1226,28 @@ router.post("/keys/logout", async (req, res): Promise<void> => {
 
   const [record] = await db.select().from(keysTable).where(eq(keysTable.key, key));
   if (record) {
+    // Lấy thông tin thiết bị trước khi xóa để gửi thông báo Discord
+    const [deviceRow] = await db.select().from(devicesTable)
+      .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
+
     await db.delete(devicesTable)
       .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
+
+    // Xóa khỏi online map và gửi thông báo offline lên Discord
+    const prevOnline = deviceOnlineMap.get(deviceId);
+    deviceOnlineMap.delete(deviceId);
+    sendDiscordLog({
+      event:      "KEY_OFFLINE",
+      key:        record.key,
+      tier:       record.tier,
+      deviceName: deviceRow?.deviceName ?? prevOnline?.deviceName ?? "Unknown",
+      deviceId:   deviceId,
+      deviceOs:   deviceRow?.deviceOs  ?? prevOnline?.deviceOs   ?? "",
+      deviceSdk:  deviceRow?.deviceSdk ?? prevOnline?.deviceSdk  ?? 0,
+      deviceRam:  deviceRow?.deviceRam ?? prevOnline?.deviceRam  ?? "",
+      expiresAt:  record.expiresAt,
+      label:      record.label,
+    }).catch(() => {});
   }
   res.json({ ok: true });
 });
