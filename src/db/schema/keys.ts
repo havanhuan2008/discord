@@ -13,6 +13,7 @@ export const keysTable = pgTable("keys", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
   discordUserId: text("discord_user_id").notNull().default(""),
   note: text("note").notNull().default(""),
+  tier: text("tier").notNull().default("free"), // "free" | "vip"
 });
 
 export const insertKeySchema = createInsertSchema(keysTable).omit({ id: true, createdAt: true, updatedAt: true });

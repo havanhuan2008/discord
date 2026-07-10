@@ -8,7 +8,7 @@ import {
   EmbedBuilder,
 } from "discord.js";
 import { eq, and, sql } from "drizzle-orm";
-import { db, keysTable, devicesTable } from "../db";
+import { db, keysTable, devicesTable, notificationsTable } from "../db";
 import { logger } from "./logger";
 
 const TOKEN    = process.env.DISCORD_BOT_TOKEN ?? "";
@@ -32,14 +32,26 @@ function statusEmoji(k: { isActive: boolean; expiresAt: Date | null }): string {
   return "✅";
 }
 
+function tierBadge(tier: string): string {
+  return tier === "vip" ? "👑 VIP" : "🆓 FREE";
+}
+
 const commands = [
   new SlashCommandBuilder()
     .setName("taokey")
     .setDescription("Tạo key mới")
     .addIntegerOption(o => o.setName("ngay").setDescription("Số ngày hiệu lực (0 = vĩnh viễn)").setRequired(true))
+    .addStringOption(o => o.setName("loai").setDescription("Loại key: free hoặc vip (mặc định: free)").setRequired(false))
     .addIntegerOption(o => o.setName("thietbi").setDescription("Số thiết bị tối đa").setRequired(false))
     .addStringOption(o => o.setName("nhan").setDescription("Nhãn / tên key").setRequired(false))
-    .addStringOption(o => o.setName("ghichu").setDescription("Ghi chú").setRequired(false))
+    .addStringOption(o => o.setName("ghichu").setDescription("Ghi chú hiển thị trong app").setRequired(false))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName("nangcap")
+    .setDescription("Nâng cấp / hạ cấp tier của key")
+    .addStringOption(o => o.setName("key").setDescription("Key cần đổi tier").setRequired(true))
+    .addStringOption(o => o.setName("loai").setDescription("free hoặc vip").setRequired(true))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -55,7 +67,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("khoakey")
-    .setDescription("Khóa key")
+    .setDescription("Khóa key (người dùng bị đẩy ra ngay lập tức)")
     .addStringOption(o => o.setName("key").setDescription("Key cần khóa").setRequired(true))
     .toJSON(),
 
@@ -100,6 +112,13 @@ const commands = [
     .setName("online")
     .setDescription("Xem thiết bị online trong 5 phút gần nhất")
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName("thongbao")
+    .setDescription("Gửi thông báo đến TẤT CẢ người dùng đang dùng app")
+    .addStringOption(o => o.setName("tieude").setDescription("Tiêu đề thông báo").setRequired(true))
+    .addStringOption(o => o.setName("noidung").setDescription("Nội dung thông báo").setRequired(true))
+    .toJSON(),
 ];
 
 async function findKey(keyStr: string) {
@@ -108,180 +127,278 @@ async function findKey(keyStr: string) {
 }
 
 async function handleInteraction(interaction: ChatInputCommandInteraction) {
-  if (!interaction.isChatInputCommand()) return;
-
-  const name = interaction.commandName;
-  await interaction.deferReply({ ephemeral: false });
+  await interaction.deferReply({ flags: 64 });
 
   try {
-    if (name === "taokey") {
+    const cmd = interaction.commandName;
+
+    // ── /taokey ───────────────────────────────────────────────────────────────
+    if (cmd === "taokey") {
       const days      = interaction.options.getInteger("ngay", true);
+      const tierInput = interaction.options.getString("loai") ?? "free";
       const maxDev    = interaction.options.getInteger("thietbi") ?? 1;
       const label     = interaction.options.getString("nhan") ?? "";
       const note      = interaction.options.getString("ghichu") ?? "";
-      const key       = generateKey();
+      const tier      = ["free", "vip"].includes(tierInput.toLowerCase()) ? tierInput.toLowerCase() : "free";
+
+      const key = generateKey();
       const expiresAt = days > 0 ? new Date(Date.now() + days * 86400000) : null;
 
       const [record] = await db.insert(keysTable).values({
-        key, label, maxDevices: maxDev, isActive: true,
-        expiresAt: expiresAt ?? undefined,
-        discordUserId: interaction.user.id,
+        key,
+        label,
         note,
+        maxDevices: maxDev,
+        expiresAt,
+        discordUserId: interaction.user.id,
+        tier,
       }).returning();
 
       const embed = new EmbedBuilder()
-        .setColor(0x00e676)
-        .setTitle("✅ Tạo key thành công")
+        .setColor(tier === "vip" ? 0xffd700 : 0x00bcd4)
+        .setTitle(`${tier === "vip" ? "👑" : "🆓"} Key đã được tạo`)
         .addFields(
-          { name: "🔑 Key", value: `\`${record.key}\``, inline: false },
-          { name: "🏷️ Nhãn", value: label || "—", inline: true },
-          { name: "📱 Thiết bị tối đa", value: `${maxDev}`, inline: true },
-          { name: "⏳ Hết hạn", value: days === 0 ? "Vĩnh viễn" : `${days} ngày (${formatDate(expiresAt)})`, inline: false },
-          { name: "📝 Ghi chú", value: note || "—", inline: false },
+          { name: "🔑 Key",        value: `\`${record.key}\``,            inline: false },
+          { name: "📛 Nhãn",       value: label || "—",                   inline: true  },
+          { name: "🎯 Loại",       value: tierBadge(tier),                inline: true  },
+          { name: "📅 Hết hạn",    value: formatDate(expiresAt),          inline: true  },
+          { name: "📱 Thiết bị",   value: `${maxDev}`,                    inline: true  },
+          { name: "📝 Ghi chú",    value: note || "—",                    inline: false },
         )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
+    }
 
-    } else if (name === "xemkey") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
-      const record = await findKey(keyStr);
-      if (!record) {
-        await interaction.editReply("❌ Không tìm thấy key này.");
+    // ── /nangcap ─────────────────────────────────────────────────────────────
+    else if (cmd === "nangcap") {
+      const keyStr    = interaction.options.getString("key", true);
+      const tierInput = interaction.options.getString("loai", true).toLowerCase();
+
+      if (!["free", "vip"].includes(tierInput)) {
+        await interaction.editReply("❌ Loại phải là `free` hoặc `vip`.");
         return;
       }
+
+      const record = await findKey(keyStr);
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+
+      await db.update(keysTable).set({ tier: tierInput }).where(eq(keysTable.id, record.id));
+
+      const embed = new EmbedBuilder()
+        .setColor(tierInput === "vip" ? 0xffd700 : 0x00bcd4)
+        .setTitle("🔄 Đã đổi tier key")
+        .addFields(
+          { name: "🔑 Key",    value: `\`${record.key}\``,  inline: false },
+          { name: "🎯 Tier mới", value: tierBadge(tierInput), inline: true  },
+        )
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /xemkey ──────────────────────────────────────────────────────────────
+    else if (cmd === "xemkey") {
+      const keyStr = interaction.options.getString("key", true);
+      const record = await findKey(keyStr);
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+
       const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
+
       const embed = new EmbedBuilder()
         .setColor(record.isActive ? 0x00e676 : 0xff1744)
         .setTitle(`${statusEmoji(record)} Key Info`)
         .addFields(
-          { name: "🔑 Key", value: `\`${record.key}\``, inline: false },
-          { name: "🏷️ Nhãn", value: record.label || "—", inline: true },
-          { name: "📌 Trạng thái", value: record.isActive ? "Hoạt động" : "Đã khóa", inline: true },
-          { name: "📱 Thiết bị", value: `${devices.length}/${record.maxDevices}`, inline: true },
-          { name: "⏳ Hết hạn", value: formatDate(record.expiresAt), inline: true },
-          { name: "📅 Tạo lúc", value: formatDate(record.createdAt), inline: true },
-          { name: "📝 Ghi chú", value: record.note || "—", inline: false },
+          { name: "🔑 Key",      value: `\`${record.key}\``,                    inline: false },
+          { name: "📛 Nhãn",     value: record.label || "—",                    inline: true  },
+          { name: "🎯 Tier",     value: tierBadge(record.tier),                 inline: true  },
+          { name: "📅 Hết hạn",  value: formatDate(record.expiresAt),           inline: true  },
+          { name: "📱 Thiết bị", value: `${devices.length}/${record.maxDevices}`, inline: true  },
+          { name: "📝 Ghi chú",  value: record.note || "—",                     inline: false },
         )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
+    }
 
-    } else if (name === "danhsachkey") {
-      const keys = await db.select().from(keysTable).orderBy(keysTable.createdAt).limit(20);
-      if (keys.length === 0) {
+    // ── /danhsachkey ─────────────────────────────────────────────────────────
+    else if (cmd === "danhsachkey") {
+      const keys = await db.select().from(keysTable).orderBy(keysTable.createdAt);
+      const list = keys.slice(0, 20);
+      if (list.length === 0) {
         await interaction.editReply("📭 Chưa có key nào.");
         return;
       }
-      const lines = await Promise.all(keys.map(async (k, i) => {
-        const devs = await db.select().from(devicesTable).where(eq(devicesTable.keyId, k.id));
-        const exp = k.expiresAt ? formatDate(k.expiresAt) : "Vĩnh viễn";
-        return `**${i + 1}.** \`${k.key}\` ${statusEmoji(k)} | 📱${devs.length}/${k.maxDevices} | ⏳${exp}${k.label ? ` | ${k.label}` : ""}`;
-      }));
+
+      const lines = list.map((k, i) => {
+        const exp = k.expiresAt ? `hết ${formatDate(k.expiresAt)}` : "vĩnh viễn";
+        return `${i + 1}. ${statusEmoji(k)} \`${k.key}\` — ${tierBadge(k.tier)} — ${k.label || "no label"} — ${exp}`;
+      });
+
       const embed = new EmbedBuilder()
-        .setColor(0xff1744)
-        .setTitle(`🗝️ Danh sách key (${keys.length})`)
+        .setColor(0x7c4dff)
+        .setTitle(`🗝️ Danh sách key (${list.length})`)
         .setDescription(lines.join("\n"))
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
+    }
 
-    } else if (name === "khoakey") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
+    // ── /khoakey ─────────────────────────────────────────────────────────────
+    else if (cmd === "khoakey") {
+      const keyStr = interaction.options.getString("key", true);
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key này."); return; }
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+      if (!record.isActive) { await interaction.editReply("⚠️ Key đã bị khóa rồi."); return; }
+
       await db.update(keysTable).set({ isActive: false }).where(eq(keysTable.id, record.id));
-      await interaction.editReply(`🔒 Đã khóa key \`${record.key}\``);
 
-    } else if (name === "mokey") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
+      const embed = new EmbedBuilder()
+        .setColor(0xff1744)
+        .setTitle("🔒 Đã khóa key")
+        .setDescription(`Key \`${record.key}\` đã bị khóa.\n\nNgười dùng đang dùng key này sẽ bị đăng xuất **trong vòng 2 phút**.`)
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /mokey ───────────────────────────────────────────────────────────────
+    else if (cmd === "mokey") {
+      const keyStr = interaction.options.getString("key", true);
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key này."); return; }
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+      if (record.isActive) { await interaction.editReply("⚠️ Key đang hoạt động rồi."); return; }
+
       await db.update(keysTable).set({ isActive: true }).where(eq(keysTable.id, record.id));
-      await interaction.editReply(`🔓 Đã mở khóa key \`${record.key}\``);
 
-    } else if (name === "xoakey") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
+      const embed = new EmbedBuilder()
+        .setColor(0x00e676)
+        .setTitle("🔓 Đã mở khóa key")
+        .addFields({ name: "🔑 Key", value: `\`${record.key}\``, inline: false })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /xoakey ──────────────────────────────────────────────────────────────
+    else if (cmd === "xoakey") {
+      const keyStr = interaction.options.getString("key", true);
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key này."); return; }
-      await db.delete(keysTable).where(eq(keysTable.id, record.id));
-      await interaction.editReply(`🗑️ Đã xóa key \`${record.key}\` vĩnh viễn.`);
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
 
-    } else if (name === "giahan") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
+      await db.delete(keysTable).where(eq(keysTable.id, record.id));
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff6d00)
+        .setTitle("🗑️ Đã xóa key")
+        .addFields({ name: "🔑 Key", value: `\`${record.key}\``, inline: false })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /giahan ──────────────────────────────────────────────────────────────
+    else if (cmd === "giahan") {
+      const keyStr = interaction.options.getString("key", true);
       const days   = interaction.options.getInteger("ngay", true);
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key này."); return; }
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+
       const base = record.expiresAt && record.expiresAt > new Date() ? record.expiresAt : new Date();
       const newExpiry = new Date(base.getTime() + days * 86400000);
       await db.update(keysTable).set({ expiresAt: newExpiry }).where(eq(keysTable.id, record.id));
-      await interaction.editReply(`✅ Đã gia hạn key \`${record.key}\` thêm **${days} ngày**.\nHết hạn mới: **${formatDate(newExpiry)}**`);
-
-    } else if (name === "thietbi") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
-      const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key này."); return; }
-      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
-      if (devices.length === 0) {
-        await interaction.editReply(`📱 Key \`${record.key}\` chưa có thiết bị nào đăng nhập.`);
-        return;
-      }
-      const lines = devices.map((d, i) => {
-        const ago = Math.floor((Date.now() - d.lastSeen.getTime()) / 60000);
-        const onlineBadge = ago < 5 ? "🟢" : "⚫";
-        return `**${i + 1}.** ${onlineBadge} ${d.deviceName} | ID: \`${d.deviceId.slice(0, 8)}...\` | ${ago < 1 ? "Vừa xong" : `${ago} phút trước`}`;
-      });
-      const embed = new EmbedBuilder()
-        .setColor(0x2196f3)
-        .setTitle(`📱 Thiết bị của \`${record.key}\` (${devices.length}/${record.maxDevices})`)
-        .setDescription(lines.join("\n"))
-        .setTimestamp();
-      await interaction.editReply({ embeds: [embed] });
-
-    } else if (name === "xoathietbi") {
-      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
-      const stt    = interaction.options.getInteger("stt", true);
-      const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key này."); return; }
-      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
-      const target  = devices[stt - 1];
-      if (!target) { await interaction.editReply(`❌ Không có thiết bị số ${stt}.`); return; }
-      await db.delete(devicesTable).where(eq(devicesTable.id, target.id));
-      await interaction.editReply(`✅ Đã xóa thiết bị **${target.deviceName}** khỏi key \`${record.key}\`.`);
-
-    } else if (name === "thongke") {
-      const [{ total }]   = await db.select({ total: sql<number>`count(*)` }).from(keysTable);
-      const [{ active }]  = await db.select({ active: sql<number>`count(*)` }).from(keysTable).where(eq(keysTable.isActive, true));
-      const [{ devices }] = await db.select({ devices: sql<number>`count(*)` }).from(devicesTable);
-      const now = new Date();
-      const fiveMinsAgo = new Date(now.getTime() - 5 * 60000);
-      const [{ onlineCount }] = await db.select({ onlineCount: sql<number>`count(distinct key_id)` })
-        .from(devicesTable).where(sql`${devicesTable.lastSeen} > ${fiveMinsAgo}`);
 
       const embed = new EmbedBuilder()
-        .setColor(0xff9800)
-        .setTitle("📊 Thống kê hệ thống")
+        .setColor(0x00bcd4)
+        .setTitle("📅 Đã gia hạn key")
         .addFields(
-          { name: "🗝️ Tổng key",      value: `${total}`,       inline: true },
-          { name: "✅ Key hoạt động", value: `${active}`,      inline: true },
-          { name: "🔒 Key bị khóa",   value: `${Number(total) - Number(active)}`, inline: true },
-          { name: "📱 Tổng thiết bị", value: `${devices}`,     inline: true },
-          { name: "🟢 Online (5p)",    value: `${onlineCount}`, inline: true },
+          { name: "🔑 Key",        value: `\`${record.key}\``,    inline: false },
+          { name: "➕ Thêm",        value: `${days} ngày`,         inline: true  },
+          { name: "📅 Hết hạn mới", value: formatDate(newExpiry),  inline: true  },
         )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
+    }
 
-    } else if (name === "online") {
-      const fiveMinsAgo = new Date(Date.now() - 5 * 60000);
+    // ── /thietbi ─────────────────────────────────────────────────────────────
+    else if (cmd === "thietbi") {
+      const keyStr = interaction.options.getString("key", true);
+      const record = await findKey(keyStr);
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+
+      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
+      if (devices.length === 0) {
+        await interaction.editReply(`📱 Key \`${record.key}\` chưa có thiết bị nào.`);
+        return;
+      }
+
+      const lines = devices.map((d, i) => {
+        const ago = Math.floor((Date.now() - d.lastSeen.getTime()) / 1000);
+        const agoStr = ago < 60 ? `${ago}s trước` : ago < 3600 ? `${Math.floor(ago/60)}p trước` : `${Math.floor(ago/3600)}h trước`;
+        return `${i + 1}. 📱 **${d.deviceName}** | ID: \`${d.deviceId.substring(0, 8)}...\` | ${agoStr}`;
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x7c4dff)
+        .setTitle(`📱 Thiết bị của key \`${record.key}\``)
+        .setDescription(lines.join("\n"))
+        .setFooter({ text: `${devices.length}/${record.maxDevices} thiết bị` })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /xoathietbi ──────────────────────────────────────────────────────────
+    else if (cmd === "xoathietbi") {
+      const keyStr = interaction.options.getString("key", true);
+      const stt    = interaction.options.getInteger("stt", true);
+      const record = await findKey(keyStr);
+      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+
+      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
+      const target  = devices[stt - 1];
+      if (!target) { await interaction.editReply(`❌ Không có thiết bị số ${stt}.`); return; }
+
+      await db.delete(devicesTable).where(eq(devicesTable.id, target.id));
+
+      await interaction.editReply(`✅ Đã xóa thiết bị **${target.deviceName}** khỏi key \`${record.key}\`.`);
+    }
+
+    // ── /thongke ─────────────────────────────────────────────────────────────
+    else if (cmd === "thongke") {
+      const [{ total }]   = await db.select({ total: sql<number>`count(*)` }).from(keysTable);
+      const [{ active }]  = await db.select({ active: sql<number>`count(*)` }).from(keysTable).where(eq(keysTable.isActive, true));
+      const [{ devices }] = await db.select({ devices: sql<number>`count(*)` }).from(devicesTable);
+      const [{ vip }]     = await db.select({ vip: sql<number>`count(*)` }).from(keysTable).where(and(eq(keysTable.isActive, true), eq(keysTable.tier, "vip")));
+
+      const now = new Date();
+      const expiredKeys = await db.select().from(keysTable).where(
+        and(eq(keysTable.isActive, true), sql`${keysTable.expiresAt} < ${now}`)
+      );
+
+      const embed = new EmbedBuilder()
+        .setColor(0x7c4dff)
+        .setTitle("📊 Thống kê hệ thống")
+        .addFields(
+          { name: "🗝️ Tổng key",    value: `${Number(total)}`,            inline: true },
+          { name: "✅ Đang hoạt động", value: `${Number(active)}`,         inline: true },
+          { name: "⛔ Hết hạn",      value: `${expiredKeys.length}`,       inline: true },
+          { name: "👑 VIP",          value: `${Number(vip)}`,              inline: true },
+          { name: "🆓 FREE",         value: `${Number(active) - Number(vip)}`, inline: true },
+          { name: "📱 Thiết bị",     value: `${Number(devices)}`,          inline: true },
+        )
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /online ──────────────────────────────────────────────────────────────
+    else if (cmd === "online") {
+      const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
       const onlineDevices = await db.select().from(devicesTable)
-        .where(sql`${devicesTable.lastSeen} > ${fiveMinsAgo}`);
+        .where(sql`${devicesTable.lastSeen} > ${fiveMinAgo}`);
 
       if (onlineDevices.length === 0) {
-        await interaction.editReply("🔴 Không có thiết bị nào online trong 5 phút gần nhất.");
+        await interaction.editReply("😴 Không có thiết bị nào online trong 5 phút gần nhất.");
         return;
       }
 
       const lines = await Promise.all(onlineDevices.map(async d => {
         const [k] = await db.select().from(keysTable).where(eq(keysTable.id, d.keyId));
         const ago = Math.floor((Date.now() - d.lastSeen.getTime()) / 1000);
-        return `🟢 **${d.deviceName}** | Key: \`${k?.key ?? "?"}\` | ${ago < 60 ? `${ago}s` : `${Math.floor(ago / 60)}p`} trước`;
+        const badge = k?.tier === "vip" ? "👑" : "🆓";
+        return `🟢 ${badge} **${d.deviceName}** | Key: \`${k?.key ?? "?"}\` | ${ago < 60 ? `${ago}s` : `${Math.floor(ago / 60)}p`} trước`;
       }));
 
       const embed = new EmbedBuilder()
@@ -291,6 +408,31 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
     }
+
+    // ── /thongbao ─────────────────────────────────────────────────────────────
+    else if (cmd === "thongbao") {
+      const title = interaction.options.getString("tieude", true);
+      const body  = interaction.options.getString("noidung", true);
+
+      const [notif] = await db.insert(notificationsTable).values({
+        title,
+        body,
+        sentBy: interaction.user.tag,
+      }).returning();
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff9800)
+        .setTitle("📢 Đã gửi thông báo")
+        .setDescription("Thông báo sẽ hiển thị với **tất cả người dùng** khi họ mở app hoặc trong lần heartbeat tiếp theo (≤2 phút).")
+        .addFields(
+          { name: "📌 Tiêu đề",  value: title, inline: false },
+          { name: "📝 Nội dung", value: body,  inline: false },
+        )
+        .setFooter({ text: `ID: ${notif.id} · Bởi: ${interaction.user.tag}` })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
   } catch (err) {
     logger.error({ err }, "Discord command error");
     await interaction.editReply("❌ Có lỗi xảy ra. Vui lòng thử lại.");
@@ -305,7 +447,7 @@ export async function startDiscordBot(): Promise<void> {
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-  client.once("ready", async () => {
+  client.once("clientReady", async () => {
     logger.info({ tag: client.user?.tag }, "Discord bot ready");
 
     const rest = new REST({ version: "10" }).setToken(TOKEN);
