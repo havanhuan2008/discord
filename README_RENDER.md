@@ -28,6 +28,7 @@
 - Tài khoản Render.com (miễn phí)
 - Database PostgreSQL (Render cung cấp miễn phí)
 - Discord Bot đã tạo sẵn
+- Link4m API token (đã tích hợp sẵn: `69b825a52226d2546845d241`)
 
 ---
 
@@ -67,6 +68,8 @@
    | `DISCORD_BOT_TOKEN` | Token bot Discord |
    | `DISCORD_GUILD_ID` | ID server Discord |
    | `ADMIN_SECRET_KEY` | Chuỗi secret tự đặt (VD: `MyS3cr3tKey2024`) |
+   | `LINK4M_API_TOKEN` | Token API Link4m — mặc định `69b825a52226d2546845d241` |
+   | `API_BASE_URL` | URL deploy của API (VD: `https://aujunpeak-api.onrender.com`) |
    | `NODE_ENV` | `production` |
 
 5. Nhấn **Create Web Service** → đợi build xong (~2-3 phút)
