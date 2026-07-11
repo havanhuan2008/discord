@@ -1025,7 +1025,7 @@ export type DiscordLogEvent =
   | "KEY_OFFLINE"        // Thiết bị logout
   | "KEY_EXPIRED_HB"     // Key hết hạn được phát hiện qua heartbeat
   | "KEY_REVOKED_HB"     // Key bị thu hồi được phát hiện qua heartbeat
-  | "GOOGLE_LOGIN";      // App đăng nhập Google thành công
+  | "GOOGLE_LOGIN";      // Người dùng đăng nhập Google thành công từ app
 
 export interface DiscordLogPayload {
   event:          DiscordLogEvent;
@@ -1040,9 +1040,9 @@ export interface DiscordLogPayload {
   isNewDevice?:   boolean;
   label?:         string;
   note?:          string;
-  googleEmail?:   string;
-  googleName?:    string;
-  googleId?:      string;
+  googleEmail?:   string;   // Email tài khoản Google (khi event=GOOGLE_LOGIN)
+  googleName?:    string;   // Tên tài khoản Google
+  googlePhotoUrl?: string;  // URL ảnh đại diện Google
 }
 
 function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: string } {
@@ -1113,13 +1113,10 @@ export async function sendDiscordLog(payload: DiscordLogPayload): Promise<void> 
     fields.push({ name: "📝 Ghi chú", value: payload.note, inline: false });
   }
   if (payload.googleName) {
-    fields.push({ name: "👤 Tên Google", value: payload.googleName, inline: true });
+    fields.push({ name: "👤 Google Name", value: payload.googleName, inline: true });
   }
   if (payload.googleEmail) {
-    fields.push({ name: "📧 Email Google", value: payload.googleEmail, inline: true });
-  }
-  if (payload.googleId) {
-    fields.push({ name: "🆔 Google ID", value: `\`${payload.googleId}\``, inline: false });
+    fields.push({ name: "📧 Google Email", value: payload.googleEmail, inline: true });
   }
 
   const embed = {

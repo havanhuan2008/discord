@@ -1487,4 +1487,44 @@ router.get("/admin/stats", requireAdmin, async (req, res): Promise<void> => {
   res.json({ ok: true, total: Number(total), active: Number(active), devices: Number(devices), expired: expired.length, vip: Number(vip) });
 });
 
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GOOGLE LOGIN NOTIFY — Thông báo Discord khi user đăng nhập Google thành công
+// POST /api/keys/google-login-notify
+// Body: { deviceId, deviceName, googleEmail, googleName, googlePhotoUrl? }
+// ═════════════════════════════════════════════════════════════════════════════
+router.post("/keys/google-login-notify", async (req, res): Promise<void> => {
+  const { deviceId, deviceName, googleEmail, googleName, googlePhotoUrl } = req.body as {
+    deviceId?: string;
+    deviceName?: string;
+    googleEmail?: string;
+    googleName?: string;
+    googlePhotoUrl?: string;
+  };
+
+  if (!googleEmail || !googleName) {
+    res.status(400).json({ ok: false, message: "Thiếu thông tin Google" });
+    return;
+  }
+
+  const safeDeviceName = escapeHtml(deviceName ?? "Thiết bị không rõ");
+  const safeEmail      = escapeHtml(googleEmail);
+  const safeName       = escapeHtml(googleName);
+
+  req.log.info({ googleEmail: safeEmail, deviceId }, "Google login notify received");
+
+  // Gửi thông báo Discord ngay mà không cần await (non-blocking)
+  sendDiscordLog({
+    event:          "GOOGLE_LOGIN",
+    deviceName:     safeDeviceName,
+    deviceId:       deviceId ?? "",
+    googleEmail:    safeEmail,
+    googleName:     safeName,
+    googlePhotoUrl: googlePhotoUrl,
+    note:           `Người dùng đã đăng nhập Google thành công từ app · ${safeName} (${safeEmail})`,
+  }).catch(() => {});
+
+  res.json({ ok: true, message: "Đã ghi nhận đăng nhập Google" });
+});
+
 export default router;
