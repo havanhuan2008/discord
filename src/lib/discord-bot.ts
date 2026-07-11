@@ -1024,21 +1024,25 @@ export type DiscordLogEvent =
   | "KEY_ONLINE"         // Thiết bị vừa online (heartbeat sau offline)
   | "KEY_OFFLINE"        // Thiết bị logout
   | "KEY_EXPIRED_HB"     // Key hết hạn được phát hiện qua heartbeat
-  | "KEY_REVOKED_HB";    // Key bị thu hồi được phát hiện qua heartbeat
+  | "KEY_REVOKED_HB"     // Key bị thu hồi được phát hiện qua heartbeat
+  | "GOOGLE_LOGIN";      // App đăng nhập Google thành công
 
 export interface DiscordLogPayload {
-  event:        DiscordLogEvent;
-  key?:         string;
-  tier?:        string;
-  deviceName?:  string;
-  deviceId?:    string;
-  deviceOs?:    string;
-  deviceSdk?:   string | number;
-  deviceRam?:   string;
-  expiresAt?:   Date | null;
-  isNewDevice?: boolean;
-  label?:       string;
-  note?:        string;
+  event:          DiscordLogEvent;
+  key?:           string;
+  tier?:          string;
+  deviceName?:    string;
+  deviceId?:      string;
+  deviceOs?:      string;
+  deviceSdk?:     string | number;
+  deviceRam?:     string;
+  expiresAt?:     Date | null;
+  isNewDevice?:   boolean;
+  label?:         string;
+  note?:          string;
+  googleEmail?:   string;
+  googleName?:    string;
+  googleId?:      string;
 }
 
 function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: string } {
@@ -1049,6 +1053,7 @@ function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: str
     case "KEY_OFFLINE":      return { color: 0x607D8B, icon: "🔴", title: "Thiết Bị Offline" };
     case "KEY_EXPIRED_HB":   return { color: 0xFF5722, icon: "⛔", title: "Key Hết Hạn (Phát Hiện)" };
     case "KEY_REVOKED_HB":   return { color: 0xF44336, icon: "🔒", title: "Key Bị Thu Hồi (Phát Hiện)" };
+    case "GOOGLE_LOGIN":     return { color: 0x4285F4, icon: "🔵", title: "Đăng Nhập Google" };
   }
 }
 
@@ -1106,6 +1111,15 @@ export async function sendDiscordLog(payload: DiscordLogPayload): Promise<void> 
   }
   if (payload.note) {
     fields.push({ name: "📝 Ghi chú", value: payload.note, inline: false });
+  }
+  if (payload.googleName) {
+    fields.push({ name: "👤 Tên Google", value: payload.googleName, inline: true });
+  }
+  if (payload.googleEmail) {
+    fields.push({ name: "📧 Email Google", value: payload.googleEmail, inline: true });
+  }
+  if (payload.googleId) {
+    fields.push({ name: "🆔 Google ID", value: `\`${payload.googleId}\``, inline: false });
   }
 
   const embed = {
