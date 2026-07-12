@@ -14,8 +14,10 @@ import {
   PermissionFlagsBits,
 } from "discord.js";
 import { eq, and, sql } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable } from "../db";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable } from "../db";
 import { logger } from "./logger";
+
+const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY ?? "";
 
 const TOKEN    = process.env.DISCORD_BOT_TOKEN ?? "";
 const GUILD_ID = process.env.DISCORD_GUILD_ID  ?? "";
@@ -251,6 +253,32 @@ const commands = [
           { name: "Chỉ key hết hạn",     value: "expired" },
           { name: "Chỉ key đã khóa",     value: "locked"  },
         ))
+    .toJSON(),
+
+  // ── Góp ý / Báo lỗi ──────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("goyphan")
+    .setDescription("Xem danh sách báo lỗi & góp ý từ người dùng")
+    .addStringOption(o =>
+      o.setName("loai")
+        .setDescription("Lọc theo loại")
+        .setRequired(false)
+        .addChoices(
+          { name: "Tất cả",        value: "all"      },
+          { name: "Báo lỗi",       value: "bug"      },
+          { name: "Góp ý",         value: "feedback" },
+          { name: "Liên hệ hỗ trợ", value: "contact" },
+        ))
+    .toJSON(),
+
+  // ── Push notification đến thiết bị ───────────────────────────────────────
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("thongbaodaybp")
+    .setDescription("📲 Gửi push notification đến TẤT CẢ thiết bị (kể cả khi app đóng)")
+    .addStringOption(o => o.setName("tieude").setDescription("Tiêu đề thông báo").setRequired(true))
+    .addStringOption(o => o.setName("noidung").setDescription("Nội dung thông báo").setRequired(true))
     .toJSON(),
 ];
 
@@ -968,6 +996,96 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       });
     }
 
+    // ── /goyphan ─────────────────────────────────────────────────────────────
+    else if (cmd === "goyphan") {
+      const filter = interaction.options.getString("loai") ?? "all";
+
+      const all = await db.select().from(feedbacksTable).orderBy(feedbacksTable.createdAt);
+      const rows = filter === "all" ? all : all.filter(f => f.type === filter);
+
+      if (rows.length === 0) {
+        await interaction.editReply("📭 Chưa có phản hồi nào.");
+        return;
+      }
+
+      const typeIcon: Record<string, string> = { bug: "🐛", feedback: "⭐", contact: "💬" };
+      const lines = rows.slice(0, 20).map((f, i) => {
+        const stars = f.stars > 0 ? "⭐".repeat(f.stars) : "–";
+        const contact = f.contact ? ` · 📧 ${f.contact}` : "";
+        return `**${i + 1}. ${typeIcon[f.type] ?? "📩"} [${f.type.toUpperCase()}]** ${f.title}\n> ${f.message.slice(0, 120)}${f.message.length > 120 ? "…" : ""}\n> ${stars}${contact}`;
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x00e5ff)
+        .setTitle(`📋 Báo lỗi & Góp ý (${rows.length} mục)`)
+        .setDescription(lines.join("\n\n"))
+        .setFooter({ text: `Hiển thị ${Math.min(20, rows.length)}/${rows.length} mục · Lọc: ${filter}` })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /thongbaodaybp ───────────────────────────────────────────────────────
+    else if (cmd === "thongbaodaybp") {
+      const title  = interaction.options.getString("tieude", true);
+      const body   = interaction.options.getString("noidung", true);
+
+      // Đếm số thiết bị đã đăng ký token
+      const tokens = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
+
+      if (tokens.length === 0) {
+        await interaction.editReply("📭 Chưa có thiết bị nào đăng ký nhận push notification.");
+        return;
+      }
+
+      if (!FCM_SERVER_KEY) {
+        await interaction.editReply("⚠️ **FCM_SERVER_KEY** chưa được cấu hình trên server. Vui lòng thêm biến môi trường này.");
+        return;
+      }
+
+      // Gửi FCM batch
+      let sent = 0; let failed = 0;
+      const BATCH = 500;
+      const allTokens = tokens.map(t => t.fcmToken);
+      for (let i = 0; i < allTokens.length; i += BATCH) {
+        const batch = allTokens.slice(i, i + BATCH);
+        try {
+          const fcmRes = await fetch("https://fcm.googleapis.com/fcm/send", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `key=${FCM_SERVER_KEY}`,
+            },
+            body: JSON.stringify({
+              registration_ids: batch,
+              notification: { title, body, sound: "default" },
+              priority: "high",
+            }),
+          });
+          if (fcmRes.ok) {
+            const json = await fcmRes.json() as { success?: number; failure?: number };
+            sent   += json.success  ?? 0;
+            failed += json.failure  ?? 0;
+          } else { failed += batch.length; }
+        } catch { failed += batch.length; }
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(sent > 0 ? 0x00e676 : 0xff5722)
+        .setTitle("📲 Push Notification Đã Gửi")
+        .addFields(
+          { name: "📌 Tiêu đề",        value: title,                inline: false },
+          { name: "📝 Nội dung",        value: body,                 inline: false },
+          { name: "📱 Tổng thiết bị",   value: `${allTokens.length}`, inline: true },
+          { name: "✅ Gửi thành công",  value: `${sent}`,            inline: true },
+          { name: "❌ Thất bại",        value: `${failed}`,          inline: true },
+        )
+        .setFooter({ text: `Gửi bởi ${interaction.user.tag}` })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+    }
+
   } catch (err) {
     logger.error({ err }, "Discord command error");
     await interaction.editReply("❌ Có lỗi xảy ra. Vui lòng thử lại.");
@@ -1043,6 +1161,12 @@ export interface DiscordLogPayload {
   googleEmail?:   string;   // Email tài khoản Google (khi event=GOOGLE_LOGIN)
   googleName?:    string;   // Tên tài khoản Google
   googlePhotoUrl?: string;  // URL ảnh đại diện Google
+  // ── Feedback-specific ──────────────────────────────────────────────────────
+  title?:     string;   // Tiêu đề feedback (dùng làm embed title override)
+  contact?:   string;   // Email / Facebook người dùng
+  deviceKey?: string;   // Key người dùng
+  starsStr?:  string;   // Chuỗi sao đánh giá "⭐⭐⭐ (3/5)"
+  savedId?:   number;   // ID đã lưu trong DB
 }
 
 function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: string } {
@@ -1054,6 +1178,7 @@ function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: str
     case "KEY_EXPIRED_HB":   return { color: 0xFF5722, icon: "⛔", title: "Key Hết Hạn (Phát Hiện)" };
     case "KEY_REVOKED_HB":   return { color: 0xF44336, icon: "🔒", title: "Key Bị Thu Hồi (Phát Hiện)" };
     case "GOOGLE_LOGIN":     return { color: 0x4285F4, icon: "🔵", title: "Đăng Nhập Google" };
+    case "FEEDBACK":         return { color: 0x00E5FF, icon: "📩", title: "Phản Hồi Người Dùng" };
   }
 }
 
@@ -1118,10 +1243,23 @@ export async function sendDiscordLog(payload: DiscordLogPayload): Promise<void> 
   if (payload.googleEmail) {
     fields.push({ name: "📧 Google Email", value: payload.googleEmail, inline: true });
   }
+  // ── Feedback fields ─────────────────────────────────────────────────────
+  if (payload.starsStr) {
+    fields.push({ name: "⭐ Đánh giá", value: payload.starsStr, inline: true });
+  }
+  if (payload.contact) {
+    fields.push({ name: "📧 Liên hệ", value: payload.contact, inline: true });
+  }
+  if (payload.deviceKey) {
+    fields.push({ name: "🗝️ Device Key", value: `\`${payload.deviceKey.slice(0, 20)}…\``, inline: true });
+  }
+  if (payload.savedId !== undefined) {
+    fields.push({ name: "🆔 DB ID", value: `#${payload.savedId}`, inline: true });
+  }
 
   const embed = {
     color:     meta.color,
-    title:     `${meta.icon} ${meta.title}`,
+    title:     payload.title ? `${meta.icon} ${payload.title}` : `${meta.icon} ${meta.title}`,
     fields,
     timestamp: new Date().toISOString(),
     footer:    { text: "Aujunpeak Monitor" },
