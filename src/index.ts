@@ -1,6 +1,6 @@
-import app from "./app";
-import { logger } from "./lib/logger";
-import { startDiscordBot } from "./lib/discord-bot";
+import app from "./app.js";
+import { logger } from "./lib/logger.js";
+import { startDiscordBot } from "./lib/discord-bot.js";
 
 const port = Number(process.env.PORT ?? 3000);
 

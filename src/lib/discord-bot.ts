@@ -13,11 +13,10 @@ import {
   ComponentType,
   PermissionFlagsBits,
 } from "discord.js";
-import { eq, and, sql } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable } from "../db";
-import { logger } from "./logger";
-
-const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY ?? "";
+import { eq, and, sql, inArray } from "drizzle-orm";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable } from "../db/index.js";
+import { logger } from "./logger.js";
+import { sendFcmPush, isFcmConfigured } from "./fcm.js";
 
 const TOKEN    = process.env.DISCORD_BOT_TOKEN ?? "";
 const GUILD_ID = process.env.DISCORD_GUILD_ID  ?? "";
@@ -1027,58 +1026,56 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
 
     // ── /thongbaodaybp ───────────────────────────────────────────────────────
     else if (cmd === "thongbaodaybp") {
-      const title  = interaction.options.getString("tieude", true);
-      const body   = interaction.options.getString("noidung", true);
+      const title = interaction.options.getString("tieude", true);
+      const body  = interaction.options.getString("noidung", true);
 
-      // Đếm số thiết bị đã đăng ký token
-      const tokens = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
-
-      if (tokens.length === 0) {
-        await interaction.editReply("📭 Chưa có thiết bị nào đăng ký nhận push notification.");
+      // Kiểm tra cấu hình FCM
+      if (!isFcmConfigured()) {
+        await interaction.editReply(
+          "⚠️ **FIREBASE_SERVICE_ACCOUNT_JSON** chưa được cấu hình trên server.\n" +
+          "Vào Firebase Console → Project settings → Service accounts → Generate new private key → đặt vào biến môi trường `FIREBASE_SERVICE_ACCOUNT_JSON`."
+        );
         return;
       }
 
-      if (!FCM_SERVER_KEY) {
-        await interaction.editReply("⚠️ **FCM_SERVER_KEY** chưa được cấu hình trên server. Vui lòng thêm biến môi trường này.");
+      // Lấy tất cả FCM token
+      const rows = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
+
+      if (rows.length === 0) {
+        await interaction.editReply(
+          "📭 Chưa có thiết bị nào đăng ký nhận push notification.\n" +
+          "Người dùng cần **cài app → đăng nhập key** để token được đăng ký tự động."
+        );
         return;
       }
 
-      // Gửi FCM batch
-      let sent = 0; let failed = 0;
-      const BATCH = 500;
-      const allTokens = tokens.map(t => t.fcmToken);
-      for (let i = 0; i < allTokens.length; i += BATCH) {
-        const batch = allTokens.slice(i, i + BATCH);
-        try {
-          const fcmRes = await fetch("https://fcm.googleapis.com/fcm/send", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `key=${FCM_SERVER_KEY}`,
-            },
-            body: JSON.stringify({
-              registration_ids: batch,
-              notification: { title, body, sound: "default" },
-              priority: "high",
-            }),
-          });
-          if (fcmRes.ok) {
-            const json = await fcmRes.json() as { success?: number; failure?: number };
-            sent   += json.success  ?? 0;
-            failed += json.failure  ?? 0;
-          } else { failed += batch.length; }
-        } catch { failed += batch.length; }
+      const allTokens = rows.map(r => r.fcmToken);
+
+      // Gửi qua FCM v1 API
+      const result = await sendFcmPush(allTokens, title, body);
+
+      // Dọn token hết hạn khỏi DB
+      if (result.invalidTokens.length > 0) {
+        await db.delete(fcmTokensTable)
+          .where(inArray(fcmTokensTable.fcmToken, result.invalidTokens))
+          .catch(() => {});
       }
 
       const embed = new EmbedBuilder()
-        .setColor(sent > 0 ? 0x00e676 : 0xff5722)
+        .setColor(result.sent > 0 ? 0x00e676 : 0xff5722)
         .setTitle("📲 Push Notification Đã Gửi")
         .addFields(
-          { name: "📌 Tiêu đề",        value: title,                inline: false },
-          { name: "📝 Nội dung",        value: body,                 inline: false },
-          { name: "📱 Tổng thiết bị",   value: `${allTokens.length}`, inline: true },
-          { name: "✅ Gửi thành công",  value: `${sent}`,            inline: true },
-          { name: "❌ Thất bại",        value: `${failed}`,          inline: true },
+          { name: "📌 Tiêu đề",          value: title,                    inline: false },
+          { name: "📝 Nội dung",          value: body,                     inline: false },
+          { name: "📱 Tổng thiết bị",     value: `${result.total}`,        inline: true  },
+          { name: "✅ Gửi thành công",    value: `${result.sent}`,         inline: true  },
+          { name: "❌ Thất bại",          value: `${result.failed}`,       inline: true  },
+          ...(result.invalidTokens.length > 0
+            ? [{ name: "🗑️ Token đã xóa", value: `${result.invalidTokens.length} token hết hạn`, inline: true }]
+            : []),
+          ...(result.error
+            ? [{ name: "⚠️ Lỗi", value: result.error, inline: false }]
+            : []),
         )
         .setFooter({ text: `Gửi bởi ${interaction.user.tag}` })
         .setTimestamp();

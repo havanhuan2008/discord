@@ -1,8 +1,8 @@
 import { Router, type IRouter } from "express";
 import { eq, and, sql, inArray } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable } from "../db";
-import { logger } from "../lib/logger";
-import { sendDiscordLog } from "../lib/discord-bot";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable } from "../db/index.js";
+import { logger } from "../lib/logger.js";
+import { sendDiscordLog } from "../lib/discord-bot.js";
 import https from "https";
 import http from "http";
 

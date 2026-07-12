@@ -4,9 +4,9 @@
  */
 
 import { Router, type IRouter } from "express";
-import { db, feedbacksTable } from "../db";
-import { sendDiscordLog } from "../lib/discord-bot";
-import { logger } from "../lib/logger";
+import { db, feedbacksTable } from "../db/index.js";
+import { sendDiscordLog } from "../lib/discord-bot.js";
+import { logger } from "../lib/logger.js";
 
 const router: IRouter = Router();
 

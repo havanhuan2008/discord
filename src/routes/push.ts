@@ -1,18 +1,15 @@
 /**
- * POST /api/push/send     — gửi FCM push notification đến tất cả thiết bị đã đăng ký
+ * POST /api/push/send        — gửi FCM push đến tất cả thiết bị đã đăng ký (dùng admin secret)
  * POST /api/devices/register-fcm — app gửi FCM token lên để lưu
  */
 
 import { Router, type IRouter } from "express";
-import { db, fcmTokensTable } from "../db";
-import { logger } from "../lib/logger";
-import { eq } from "drizzle-orm";
-import { sanitize as _sanitize } from "../lib/utils";
+import { db, fcmTokensTable } from "../db/index.js";
+import { logger } from "../lib/logger.js";
+import { sendFcmPush, isFcmConfigured } from "../lib/fcm.js";
+import { eq, inArray } from "drizzle-orm";
 
 const router: IRouter = Router();
-
-const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY ?? "";          // Legacy HTTP (v1 dùng service account)
-const FCM_PROJECT_ID = process.env.FIREBASE_PROJECT_ID ?? "";
 
 function sanitize(s: unknown): string {
   if (typeof s !== "string") return "";
@@ -31,7 +28,6 @@ router.post("/devices/register-fcm", async (req, res): Promise<void> => {
   }
 
   try {
-    // Upsert theo token — nếu đã tồn tại thì cập nhật thời gian
     const existing = await db.select().from(fcmTokensTable)
       .where(eq(fcmTokensTable.fcmToken, fcmToken));
 
@@ -56,9 +52,8 @@ router.post("/devices/register-fcm", async (req, res): Promise<void> => {
 });
 
 // ─── Gửi push notification đến tất cả thiết bị ───────────────────────────────
-// Body: { title, body, adminSecret }
 router.post("/push/send", async (req, res): Promise<void> => {
-  const adminSecret = sanitize(req.body.adminSecret);
+  const adminSecret    = sanitize(req.body.adminSecret);
   const expectedSecret = process.env.ADMIN_SECRET ?? "";
 
   if (!expectedSecret || adminSecret !== expectedSecret) {
@@ -74,11 +69,14 @@ router.post("/push/send", async (req, res): Promise<void> => {
     return;
   }
 
-  // Lấy tất cả FCM token
+  if (!isFcmConfigured()) {
+    res.status(503).json({ ok: false, message: "FIREBASE_SERVICE_ACCOUNT_JSON chưa được cấu hình trên server" });
+    return;
+  }
+
   let tokens: string[] = [];
   try {
-    const rows = await db.select({ fcmToken: fcmTokensTable.fcmToken })
-      .from(fcmTokensTable);
+    const rows = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
     tokens = rows.map(r => r.fcmToken);
   } catch (err) {
     logger.error({ err }, "push/send: DB error fetching tokens");
@@ -87,59 +85,28 @@ router.post("/push/send", async (req, res): Promise<void> => {
   }
 
   if (tokens.length === 0) {
-    res.json({ ok: true, sent: 0, message: "Không có thiết bị nào đã đăng ký token" });
+    res.json({ ok: true, sent: 0, message: "Chưa có thiết bị nào đăng ký nhận push notification" });
     return;
   }
 
-  req.log.info({ count: tokens.length }, "Sending push notification");
+  const result = await sendFcmPush(tokens, title, body);
 
-  // Gửi FCM qua Legacy HTTP API (nếu có FCM_SERVER_KEY)
-  // Để dùng FCM v1 API, thay bằng Google Auth + googleapis
-  let sent = 0;
-  let failed = 0;
-
-  if (FCM_SERVER_KEY) {
-    // Batch gửi (max 500/request theo Legacy API)
-    const BATCH = 500;
-    for (let i = 0; i < tokens.length; i += BATCH) {
-      const batch = tokens.slice(i, i + BATCH);
-      try {
-        const fcmRes = await fetch("https://fcm.googleapis.com/fcm/send", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `key=${FCM_SERVER_KEY}`,
-          },
-          body: JSON.stringify({
-            registration_ids: batch,
-            notification: { title, body, sound: "default" },
-            priority: "high",
-          }),
-        });
-        if (fcmRes.ok) {
-          const json = await fcmRes.json() as { success?: number; failure?: number };
-          sent   += json.success  ?? 0;
-          failed += json.failure  ?? 0;
-        } else {
-          failed += batch.length;
-        }
-      } catch (err) {
-        logger.error({ err }, "FCM batch send error");
-        failed += batch.length;
-      }
-    }
-  } else {
-    // Chưa cấu hình FCM_SERVER_KEY → log warning
-    logger.warn("FCM_SERVER_KEY chưa được đặt — push notification bị bỏ qua");
-    failed = tokens.length;
+  // Xóa các token không còn hợp lệ khỏi DB
+  if (result.invalidTokens.length > 0) {
+    await db.delete(fcmTokensTable)
+      .where(inArray(fcmTokensTable.fcmToken, result.invalidTokens))
+      .catch(e => logger.error({ e }, "Không xóa được invalid token"));
+    logger.info({ count: result.invalidTokens.length }, "Removed invalid FCM tokens");
   }
 
+  req.log.info({ total: result.total, sent: result.sent, failed: result.failed }, "Push notification sent");
   res.json({
-    ok: true,
-    total: tokens.length,
-    sent,
-    failed,
-    message: `Đã gửi ${sent}/${tokens.length} thông báo`,
+    ok:    true,
+    total: result.total,
+    sent:  result.sent,
+    failed: result.failed,
+    message: `Đã gửi ${result.sent}/${result.total} thông báo`,
+    ...(result.error ? { error: result.error } : {}),
   });
 });
 
