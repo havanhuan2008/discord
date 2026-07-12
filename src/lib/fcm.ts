@@ -128,7 +128,10 @@ async function sendOne(
           notification: { title, body },
           android: {
             priority: "high",
-            notification: { sound: "default" },
+            notification: {
+              sound:      "default",
+              channel_id: "aujunpeak_push",   // phải khớp CHANNEL_ID trong MyFirebaseMessagingService.kt
+            },
           },
         },
       }),
