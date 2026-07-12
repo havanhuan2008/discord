@@ -1014,21 +1014,61 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
 
   if (!thisDevice) {
     if (existingDevices.length >= record.maxDevices) {
-      res.status(200).json({
-        ok: false,
-        message: `Key đã đăng nhập trên ${existingDevices.length}/${record.maxDevices} thiết bị. Liên hệ admin.`
+      // ── Kiểm tra cài lại app trên cùng thiết bị vật lý ─────────────────────
+      // Khi user xóa app và cài lại, deviceId (UUID cũ) bị mất nhưng thông tin
+      // phần cứng (deviceName, deviceOs, deviceSdk) không đổi.
+      // Nếu tìm thấy thiết bị cũ có cùng model + OS + SDK → cập nhật deviceId mới
+      // thay vì block (chỉ áp dụng khi deviceName không phải "Unknown").
+      const sameHardware = (deviceName && deviceName !== "Unknown")
+        ? existingDevices.find(d =>
+            d.deviceName === deviceName &&
+            d.deviceOs   === (deviceOs ?? "") &&
+            Number(d.deviceSdk) === Number(deviceSdk ?? 0)
+          )
+        : undefined;
+
+      if (sameHardware) {
+        // Cùng thiết bị cài lại → cập nhật deviceId mới, giữ nguyên slot
+        await db.update(devicesTable)
+          .set({
+            deviceId,
+            lastSeen:   new Date(),
+            deviceRam:  deviceRam ?? sameHardware.deviceRam ?? "",
+          })
+          .where(eq(devicesTable.id, sameHardware.id));
+        // Ghi log để admin biết
+        sendDiscordLog({
+          event:      "KEY_REINSTALL",
+          key:        record.key,
+          tier:       record.tier,
+          deviceName: deviceName ?? "Unknown",
+          deviceId,
+          deviceOs:   deviceOs ?? "",
+          deviceSdk:  Number(deviceSdk ?? 0),
+          deviceRam:  deviceRam ?? "",
+          expiresAt:  record.expiresAt,
+          isNewDevice: false,
+          label:      record.label,
+          note:       record.note,
+        }).catch(() => {});
+      } else {
+        res.status(200).json({
+          ok: false,
+          message: `Key đã đăng nhập trên ${existingDevices.length}/${record.maxDevices} thiết bị. Liên hệ admin.`
+        });
+        return;
+      }
+    } else {
+      await db.insert(devicesTable).values({
+        keyId:      record.id,
+        deviceId,
+        deviceName: deviceName ?? "Unknown",
+        deviceOs:   deviceOs   ?? "",
+        deviceSdk:  Number(deviceSdk  ?? 0),
+        deviceRam:  deviceRam  ?? "",
+        lastSeen:   new Date(),
       });
-      return;
     }
-    await db.insert(devicesTable).values({
-      keyId:      record.id,
-      deviceId,
-      deviceName: deviceName ?? "Unknown",
-      deviceOs:   deviceOs   ?? "",
-      deviceSdk:  Number(deviceSdk  ?? 0),
-      deviceRam:  deviceRam  ?? "",
-      lastSeen:   new Date(),
-    });
   } else {
     await db.update(devicesTable)
       .set({
