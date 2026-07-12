@@ -1441,7 +1441,12 @@ export interface ChatDiscordPayload {
 
 /**
  * Gửi tin nhắn chat của người dùng lên kênh Discord dành cho admin.
- * Admin có thể trả lời bằng /chatra <sessionId> <message>.
+ *
+ * - Text message  → embed bình thường
+ * - Image (base64) → gửi kèm file attachment để admin thấy ảnh thật
+ * - Image (URL)    → embed image preview
+ *
+ * Admin trả lời bằng: /chatra <sessionId> <message>
  */
 export async function sendChatMessageToDiscord(payload: ChatDiscordPayload): Promise<void> {
   const rest = getLogRest();
@@ -1451,33 +1456,81 @@ export async function sendChatMessageToDiscord(payload: ChatDiscordPayload): Pro
     ? payload.deviceId.substring(0, 18) + "…"
     : payload.deviceId;
 
+  const isImageMsg  = payload.type === "image" && payload.imageData;
+  const isBase64Img = isImageMsg &&
+    !payload.imageData!.startsWith("http://") &&
+    !payload.imageData!.startsWith("https://");
+  const isUrlImg    = isImageMsg && !isBase64Img;
+
+  const footerText = payload.isNewSession
+    ? `Dùng /chatchapnhan ${payload.sessionId} để chấp nhận`
+    : `/chatra ${payload.sessionId} <tin nhắn> · /chatthoat ${payload.sessionId}`;
+
+  const contentField = isImageMsg
+    ? { name: "🖼️ Loại",    value: "Hình ảnh",                     inline: true }
+    : { name: "💬 Nội dung", value: payload.content || "—",         inline: false };
+
   const fields: { name: string; value: string; inline: boolean }[] = [
-    { name: "🆔 Session ID", value: `#${payload.sessionId}`, inline: true },
-    { name: "📧 Email",      value: payload.email,           inline: true },
-    { name: "👤 Tên",        value: payload.displayName || "—", inline: true },
-    { name: "📱 Device",     value: `\`${shortDeviceId}\``,  inline: false },
-    { name: "💬 Nội dung",   value: payload.content || "[Hình ảnh]", inline: false },
+    { name: "🆔 Session", value: `#${payload.sessionId}`, inline: true },
+    { name: "📧 Email",   value: payload.email,            inline: true },
+    { name: "👤 Tên",     value: payload.displayName || "—", inline: true },
+    { name: "📱 Device",  value: `\`${shortDeviceId}\``,   inline: false },
+    contentField,
   ];
 
-  const embed = {
-    color: payload.isNewSession ? 0x00bcd4 : 0x1a90ff,
+  const embed: Record<string, unknown> = {
+    color: payload.isNewSession ? 0x00bcd4 : (isImageMsg ? 0x9c27b0 : 0x1a90ff),
     title: payload.isNewSession
       ? `🆕 Yêu cầu chat mới từ ${payload.displayName || payload.email}`
-      : `💬 Tin nhắn từ ${payload.displayName || payload.email}`,
+      : isImageMsg
+        ? `🖼️ Ảnh từ ${payload.displayName || payload.email}`
+        : `💬 Tin nhắn từ ${payload.displayName || payload.email}`,
     fields,
     timestamp: new Date().toISOString(),
-    footer: {
-      text: payload.isNewSession
-        ? `Dùng /chatchapnhan ${payload.sessionId} để chấp nhận`
-        : `Dùng /chatra ${payload.sessionId} <tin nhắn> để trả lời · /chatthoat ${payload.sessionId} để kết thúc`,
-    },
+    footer: { text: footerText },
   };
 
+  // Nếu imageData là URL, nhúng preview vào embed
+  if (isUrlImg) {
+    embed["image"] = { url: payload.imageData };
+  }
+
+  // Nếu imageData là URL, nhúng vào embed luôn không cần đọc file attachment
+  if (isBase64Img) {
+    embed["image"] = { url: "attachment://user_image.jpg" };
+  }
+
   try {
-    await rest.post(Routes.channelMessages(CHAT_CHANNEL_ID) as `/${string}`, {
-      body: { embeds: [embed] },
-    });
+    if (isBase64Img) {
+      // Gửi ảnh dưới dạng file attachment để admin thấy ảnh thật
+      const buffer = Buffer.from(payload.imageData!, "base64");
+      await rest.post(Routes.channelMessages(CHAT_CHANNEL_ID) as `/${string}`, {
+        body: { embeds: [embed] },
+        files: [
+          {
+            name: "user_image.jpg",
+            data: buffer,
+            contentType: "image/jpeg",
+          },
+        ],
+      });
+    } else {
+      await rest.post(Routes.channelMessages(CHAT_CHANNEL_ID) as `/${string}`, {
+        body: { embeds: [embed] },
+      });
+    }
   } catch (err) {
     logger.warn({ err }, "sendChatMessageToDiscord: failed to post");
+    // Fallback: thử gửi embed đơn giản không kèm file
+    try {
+      const fallbackEmbed = { ...embed };
+      delete (fallbackEmbed as Record<string, unknown>)["image"];
+      fallbackEmbed["description"] = isImageMsg ? "📷 *[Người dùng gửi hình ảnh]*" : undefined;
+      await rest.post(Routes.channelMessages(CHAT_CHANNEL_ID) as `/${string}`, {
+        body: { embeds: [fallbackEmbed] },
+      });
+    } catch (err2) {
+      logger.warn({ err: err2 }, "sendChatMessageToDiscord: fallback also failed");
+    }
   }
 }
