@@ -14,7 +14,7 @@ import {
   PermissionFlagsBits,
 } from "discord.js";
 import { eq, and, sql, inArray } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable } from "../db/index.js";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable, chatSessionsTable, chatMessagesTable } from "../db/index.js";
 import { logger } from "./logger.js";
 import { sendFcmPush, isFcmConfigured } from "./fcm.js";
 
@@ -269,6 +269,44 @@ const commands = [
           { name: "Góp ý",         value: "feedback" },
           { name: "Liên hệ hỗ trợ", value: "contact" },
         ))
+    .toJSON(),
+
+
+  // ── Chat hỗ trợ ──────────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("chatchapnhan")
+    .setDescription("✅ Chấp nhận yêu cầu chat của người dùng")
+    .addIntegerOption(o => o.setName("id").setDescription("Session ID của phiên chat").setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("chatra")
+    .setDescription("💬 Trả lời người dùng trong phiên chat")
+    .addIntegerOption(o => o.setName("id").setDescription("Session ID của phiên chat").setRequired(true))
+    .addStringOption(o => o.setName("tinhnhan").setDescription("Nội dung tin nhắn").setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("chatguianh")
+    .setDescription("🖼️ Gửi ảnh đến người dùng trong phiên chat")
+    .addIntegerOption(o => o.setName("id").setDescription("Session ID của phiên chat").setRequired(true))
+    .addStringOption(o => o.setName("url").setDescription("URL ảnh cần gửi").setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("chatthoat")
+    .setDescription("🚪 Kết thúc/đóng phiên chat với người dùng")
+    .addIntegerOption(o => o.setName("id").setDescription("Session ID của phiên chat").setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("chatdanhsach")
+    .setDescription("📋 Xem danh sách các phiên chat đang chờ/hoạt động")
     .toJSON(),
 
   // ── Push notification đến thiết bị ───────────────────────────────────────
@@ -1083,6 +1121,119 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       await interaction.editReply({ embeds: [embed] });
     }
 
+
+    // ── /chatchapnhan ─────────────────────────────────────────────────────────
+    else if (cmd === "chatchapnhan") {
+      const sessionId = interaction.options.getInteger("id", true);
+      const adminUser = interaction.user;
+      const adminAvatar = adminUser.avatarURL({ size: 128 }) ?? "";
+      const adminName = adminUser.displayName || adminUser.username;
+
+      await db.execute(
+        sql`UPDATE chat_sessions SET status='accepted', admin_name=${adminName}, admin_avatar=${adminAvatar}, admin_online=true, updated_at=NOW() WHERE id=${sessionId}`
+      );
+      await db.execute(
+        sql`INSERT INTO chat_messages (session_id, sender, content, type) VALUES (${sessionId}, 'admin', ${"✅ Admin " + adminName + " đã chấp nhận trò chuyện! Xin chào bạn, tôi sẽ hỗ trợ bạn ngay."}, 'text')`
+      );
+
+      const embed = new EmbedBuilder()
+        .setColor(0x00e676)
+        .setTitle("✅ Đã chấp nhận phiên chat #" + sessionId)
+        .setDescription(`Admin **${adminName}** đã kết nối với người dùng. Dùng /chatra ${sessionId} <tin nhắn> để trả lời.`)
+        .setThumbnail(adminAvatar || null)
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /chatra ───────────────────────────────────────────────────────────────
+    else if (cmd === "chatra") {
+      const sessionId = interaction.options.getInteger("id", true);
+      const message   = interaction.options.getString("tinhnhan", true);
+      const adminName = interaction.user.displayName || interaction.user.username;
+
+      await db.execute(
+        sql`INSERT INTO chat_messages (session_id, sender, content, type) VALUES (${sessionId}, 'admin', ${message}, 'text')`
+      );
+      await db.execute(
+        sql`UPDATE chat_sessions SET updated_at=NOW() WHERE id=${sessionId}`
+      );
+
+      const embed = new EmbedBuilder()
+        .setColor(0x1a90ff)
+        .setTitle("💬 Đã gửi tin nhắn - Session #" + sessionId)
+        .addFields({ name: "👤 Admin", value: adminName, inline: true })
+        .addFields({ name: "📝 Nội dung", value: message, inline: false })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /chatguianh ───────────────────────────────────────────────────────────
+    else if (cmd === "chatguianh") {
+      const sessionId = interaction.options.getInteger("id", true);
+      const imageUrl  = interaction.options.getString("url", true);
+
+      await db.execute(
+        sql`INSERT INTO chat_messages (session_id, sender, content, type, image_data) VALUES (${sessionId}, 'admin', '[Hình ảnh từ Admin]', 'image', ${imageUrl})`
+      );
+      await db.execute(
+        sql`UPDATE chat_sessions SET updated_at=NOW() WHERE id=${sessionId}`
+      );
+
+      const embed = new EmbedBuilder()
+        .setColor(0x9c27b0)
+        .setTitle("🖼️ Đã gửi ảnh - Session #" + sessionId)
+        .setImage(imageUrl)
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /chatthoat ────────────────────────────────────────────────────────────
+    else if (cmd === "chatthoat") {
+      const sessionId = interaction.options.getInteger("id", true);
+
+      await db.execute(
+        sql`INSERT INTO chat_messages (session_id, sender, content, type) VALUES (${sessionId}, 'bot', '❌ Admin đã kết thúc phiên trò chuyện. Cảm ơn bạn đã liên hệ! Nếu cần hỗ trợ thêm hãy bắt đầu cuộc trò chuyện mới.', 'text')`
+      );
+      await db.execute(
+        sql`UPDATE chat_sessions SET status='closed', admin_online=false, updated_at=NOW() WHERE id=${sessionId}`
+      );
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff5722)
+        .setTitle("🚪 Đã đóng phiên chat #" + sessionId)
+        .setDescription("Người dùng đã được thông báo phiên chat kết thúc.")
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+    // ── /chatdanhsach ─────────────────────────────────────────────────────────
+    else if (cmd === "chatdanhsach") {
+      const result = await db.execute(
+        sql`SELECT id, device_id, email, display_name, status, created_at FROM chat_sessions WHERE status IN ('pending','accepted') ORDER BY updated_at DESC LIMIT 20`
+      );
+      const rows = (result as any).rows ?? [];
+
+      if (rows.length === 0) {
+        await interaction.editReply("📭 Không có phiên chat nào đang chờ hoặc hoạt động.");
+        return;
+      }
+
+      const lines = rows.map((r: any) =>
+        `**#${r.id}** — ${r.status === "pending" ? "⏳ CHỜ" : "✅ ĐANG CHAT"}\n` +
+        `📧 ${r.email}\n📱 ${String(r.device_id ?? "").slice(0, 14)}…\n` +
+        `💡 Dùng /chatchapnhan ${r.id} để chấp nhận`
+      );
+
+      const embed = new EmbedBuilder()
+        .setColor(0x00bcd4)
+        .setTitle(`💬 Phiên chat đang hoạt động (${rows.length})`)
+        .setDescription(lines.join("\n\n"))
+        .setFooter({ text: "Dùng /chatchapnhan <id> · /chatra <id> <msg> · /chatthoat <id>" })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+    }
+
+
   } catch (err) {
     logger.error({ err }, "Discord command error");
     await interaction.editReply("❌ Có lỗi xảy ra. Vui lòng thử lại.");
@@ -1124,6 +1275,7 @@ export async function startDiscordBot(): Promise<void> {
 // ════════════════════════════════════════════════════════════════════════════
 
 const LOG_CHANNEL_ID = process.env.DISCORD_LOG_CHANNEL_ID ?? "";
+const CHAT_CHANNEL_ID = process.env.DISCORD_CHAT_CHANNEL_ID ?? "";
 
 // Singleton REST client dùng riêng cho log channel (tách biệt với bot slash-command)
 let _logRest: REST | null = null;
@@ -1268,5 +1420,64 @@ export async function sendDiscordLog(payload: DiscordLogPayload): Promise<void> 
     });
   } catch (err) {
     logger.warn({ err }, "sendDiscordLog: failed to post to log channel");
+  }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// CHAT DISCORD INTEGRATION — gửi tin nhắn chat lên kênh Discord
+// ════════════════════════════════════════════════════════════════════════════
+
+export interface ChatDiscordPayload {
+  sessionId: number;
+  deviceId: string;
+  email: string;
+  displayName: string;
+  content: string;
+  imageData?: string;
+  type?: string;
+  isNewSession?: boolean;
+}
+
+/**
+ * Gửi tin nhắn chat của người dùng lên kênh Discord dành cho admin.
+ * Admin có thể trả lời bằng /chatra <sessionId> <message>.
+ */
+export async function sendChatMessageToDiscord(payload: ChatDiscordPayload): Promise<void> {
+  const rest = getLogRest();
+  if (!rest || !CHAT_CHANNEL_ID) return;
+
+  const shortDeviceId = payload.deviceId.length > 18
+    ? payload.deviceId.substring(0, 18) + "…"
+    : payload.deviceId;
+
+  const fields: { name: string; value: string; inline: boolean }[] = [
+    { name: "🆔 Session ID", value: `#${payload.sessionId}`, inline: true },
+    { name: "📧 Email",      value: payload.email,           inline: true },
+    { name: "👤 Tên",        value: payload.displayName || "—", inline: true },
+    { name: "📱 Device",     value: `\`${shortDeviceId}\``,  inline: false },
+    { name: "💬 Nội dung",   value: payload.content || "[Hình ảnh]", inline: false },
+  ];
+
+  const embed = {
+    color: payload.isNewSession ? 0x00bcd4 : 0x1a90ff,
+    title: payload.isNewSession
+      ? `🆕 Yêu cầu chat mới từ ${payload.displayName || payload.email}`
+      : `💬 Tin nhắn từ ${payload.displayName || payload.email}`,
+    fields,
+    timestamp: new Date().toISOString(),
+    footer: {
+      text: payload.isNewSession
+        ? `Dùng /chatchapnhan ${payload.sessionId} để chấp nhận`
+        : `Dùng /chatra ${payload.sessionId} <tin nhắn> để trả lời · /chatthoat ${payload.sessionId} để kết thúc`,
+    },
+  };
+
+  try {
+    await rest.post(Routes.channelMessages(CHAT_CHANNEL_ID) as `/${string}`, {
+      body: { embeds: [embed] },
+    });
+  } catch (err) {
+    logger.warn({ err }, "sendChatMessageToDiscord: failed to post");
   }
 }
