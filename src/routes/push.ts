@@ -4,7 +4,7 @@
  */
 
 import { Router, type IRouter } from "express";
-import { db, fcmTokensTable } from "../db/index.js";
+import { db, fcmTokensTable, notificationsTable } from "../db/index.js";
 import { logger } from "../lib/logger.js";
 import { sendFcmPush, isFcmConfigured } from "../lib/fcm.js";
 import { eq, inArray } from "drizzle-orm";
@@ -61,8 +61,10 @@ router.post("/push/send", async (req, res): Promise<void> => {
     return;
   }
 
-  const title = sanitize(req.body.title) || "Thông báo từ Aujunpeak";
-  const body  = sanitize(req.body.body)  || "";
+  const title    = sanitize(req.body.title) || "Thông báo từ Aujunpeak";
+  const body     = sanitize(req.body.body)  || "";
+  const imageUrl = sanitize(req.body.imageUrl) || undefined;
+  const link     = sanitize(req.body.link)     || undefined;
 
   if (!body) {
     res.status(400).json({ ok: false, message: "Thiếu nội dung thông báo" });
@@ -73,6 +75,19 @@ router.post("/push/send", async (req, res): Promise<void> => {
     res.status(503).json({ ok: false, message: "FIREBASE_SERVICE_ACCOUNT_JSON chưa được cấu hình trên server" });
     return;
   }
+
+  // ── FIX BUG: trước đây /push/send CHỈ gửi FCM (tức thời) mà KHÔNG lưu vào
+  // notifications table → thiết bị mới cài app sau khi push được gửi sẽ KHÔNG
+  // BAO GIỜ thấy lại thông báo này trong lịch sử (icon chuông trong app), vì
+  // bell icon chỉ đọc từ notificationsTable qua heartbeat. Giờ luôn persist
+  // trước, để MỌI thiết bị (cũ và mới) đều nhận được qua đồng bộ heartbeat,
+  // đồng thời vẫn gửi FCM ngay để có cảm giác tức thời.
+  const [notif] = await db.insert(notificationsTable).values({
+    title, body,
+    sentBy: "admin-http",
+    imageUrl: imageUrl ?? null,
+    linkUrl: link ?? null,
+  }).returning();
 
   let tokens: string[] = [];
   try {
@@ -85,11 +100,11 @@ router.post("/push/send", async (req, res): Promise<void> => {
   }
 
   if (tokens.length === 0) {
-    res.json({ ok: true, sent: 0, message: "Chưa có thiết bị nào đăng ký nhận push notification" });
+    res.json({ ok: true, id: notif.id, sent: 0, message: "Đã lưu thông báo (sẽ hiện khi mở app). Chưa có thiết bị nào đăng ký nhận push tức thời." });
     return;
   }
 
-  const result = await sendFcmPush(tokens, title, body);
+  const result = await sendFcmPush(tokens, title, body, { notifId: notif.id, imageUrl, link });
 
   // Xóa các token không còn hợp lệ khỏi DB
   if (result.invalidTokens.length > 0) {
@@ -102,6 +117,7 @@ router.post("/push/send", async (req, res): Promise<void> => {
   req.log.info({ total: result.total, sent: result.sent, failed: result.failed }, "Push notification sent");
   res.json({
     ok:    true,
+    id:    notif.id,
     total: result.total,
     sent:  result.sent,
     failed: result.failed,

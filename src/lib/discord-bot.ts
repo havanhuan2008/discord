@@ -13,10 +13,11 @@ import {
   ComponentType,
   PermissionFlagsBits,
 } from "discord.js";
-import { eq, and, sql, inArray } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable, chatSessionsTable, chatMessagesTable } from "../db/index.js";
+import { eq, and, sql } from "drizzle-orm";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, chatSessionsTable, chatMessagesTable } from "../db/index.js";
 import { logger } from "./logger.js";
-import { sendFcmPush, isFcmConfigured } from "./fcm.js";
+import { isFcmConfigured } from "./fcm.js";
+import { createAndBroadcastNotification } from "../routes/keys.js";
 
 const TOKEN    = process.env.DISCORD_BOT_TOKEN ?? "";
 const GUILD_ID = process.env.DISCORD_GUILD_ID  ?? "";
@@ -214,9 +215,11 @@ const commands = [
   new SlashCommandBuilder()
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("thongbao")
-    .setDescription("Gửi thông báo đến TẤT CẢ người dùng đang dùng app")
+    .setDescription("📢 Gửi thông báo đến TẤT CẢ người dùng (lưu vĩnh viễn + đẩy push tức thời)")
     .addStringOption(o => o.setName("tieude").setDescription("Tiêu đề thông báo").setRequired(true))
     .addStringOption(o => o.setName("noidung").setDescription("Nội dung thông báo").setRequired(true))
+    .addStringOption(o => o.setName("anh").setDescription("URL ảnh minh họa (hiển thị to trên push + trong app)").setRequired(false))
+    .addStringOption(o => o.setName("link").setDescription("Link mở khi người dùng bấm vào thông báo").setRequired(false))
     .toJSON(),
 
   new SlashCommandBuilder()
@@ -309,13 +312,15 @@ const commands = [
     .setDescription("📋 Xem danh sách các phiên chat đang chờ/hoạt động")
     .toJSON(),
 
-  // ── Push notification đến thiết bị ───────────────────────────────────────
+  // ── Push notification đến thiết bị (alias của /thongbao, giữ lại để tương thích) ──
   new SlashCommandBuilder()
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .setName("thongbaodaybp")
     .setDescription("📲 Gửi push notification đến TẤT CẢ thiết bị (kể cả khi app đóng)")
     .addStringOption(o => o.setName("tieude").setDescription("Tiêu đề thông báo").setRequired(true))
     .addStringOption(o => o.setName("noidung").setDescription("Nội dung thông báo").setRequired(true))
+    .addStringOption(o => o.setName("anh").setDescription("URL ảnh minh họa (hiển thị to trên push + trong app)").setRequired(false))
+    .addStringOption(o => o.setName("link").setDescription("Link mở khi người dùng bấm vào thông báo").setRequired(false))
     .toJSON(),
 ];
 
@@ -793,24 +798,35 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
     }
 
     // ── /thongbao ─────────────────────────────────────────────────────────────
+    // FIX: trước đây chỉ lưu vào DB (chờ heartbeat ≤2 phút mới tới) và KHÔNG
+    // đẩy push tức thời. Giờ luôn làm CẢ HAI: (1) lưu vĩnh viễn → mọi thiết bị
+    // cũ/mới đều thấy trong icon chuông qua đồng bộ heartbeat, (2) đẩy FCM ngay
+    // → thiết bị đang online nhận trong vài giây, kể cả khi app đang đóng.
     else if (cmd === "thongbao") {
-      const title = interaction.options.getString("tieude", true);
-      const body  = interaction.options.getString("noidung", true);
+      const title    = interaction.options.getString("tieude", true);
+      const body     = interaction.options.getString("noidung", true);
+      const imageUrl = interaction.options.getString("anh") ?? undefined;
+      const link     = interaction.options.getString("link") ?? undefined;
 
-      const [notif] = await db.insert(notificationsTable).values({
-        title,
-        body,
-        sentBy: interaction.user.tag,
-      }).returning();
+      const { notif, fcm } = await createAndBroadcastNotification({
+        title, body, sentBy: interaction.user.tag, imageUrl, linkUrl: link,
+      });
 
       const embed = new EmbedBuilder()
         .setColor(0xff9800)
         .setTitle("📢 Đã gửi thông báo")
-        .setDescription("Thông báo sẽ hiển thị với **tất cả người dùng** khi họ mở app hoặc trong lần heartbeat tiếp theo (≤2 phút).")
+        .setDescription(
+          fcm
+            ? `✅ Đã lưu vào lịch sử **và** đẩy push tức thời: **${fcm.sent}/${fcm.total}** thiết bị nhận ngay. Thiết bị còn lại (kể cả mới cài app) sẽ thấy trong icon chuông khi mở app.`
+            : "✅ Đã lưu vào lịch sử — hiển thị trong icon chuông của **tất cả người dùng** (cũ và mới) khi họ mở app. (Chưa cấu hình FCM nên không đẩy push tức thời.)"
+        )
         .addFields(
           { name: "📌 Tiêu đề",  value: title, inline: false },
           { name: "📝 Nội dung", value: body,  inline: false },
+          ...(imageUrl ? [{ name: "🖼️ Ảnh", value: imageUrl, inline: false }] : []),
+          ...(link ? [{ name: "🔗 Link", value: link, inline: false }] : []),
         )
+        .setImage(imageUrl ?? null)
         .setFooter({ text: `ID: ${notif.id} · Bởi: ${interaction.user.tag}` })
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
@@ -1063,59 +1079,56 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
     }
 
     // ── /thongbaodaybp ───────────────────────────────────────────────────────
+    // FIX BUG CHÍNH: trước đây lệnh này CHỈ gửi FCM (push tức thời), KHÔNG lưu
+    // vào notifications table → (1) thiết bị chưa có token FCM (mới cài app,
+    // hoặc offline lúc gửi) sẽ KHÔNG BAO GIỜ thấy lại thông báo này, ngay cả
+    // sau khi mở app; (2) thông báo không hiện trong icon chuông của bất kỳ ai.
+    // Giờ dùng cùng hàm với /thongbao: luôn lưu DB + đẩy FCM.
     else if (cmd === "thongbaodaybp") {
-      const title = interaction.options.getString("tieude", true);
-      const body  = interaction.options.getString("noidung", true);
+      const title    = interaction.options.getString("tieude", true);
+      const body     = interaction.options.getString("noidung", true);
+      const imageUrl = interaction.options.getString("anh") ?? undefined;
+      const link     = interaction.options.getString("link") ?? undefined;
 
       // Kiểm tra cấu hình FCM
       if (!isFcmConfigured()) {
         await interaction.editReply(
           "⚠️ **FIREBASE_SERVICE_ACCOUNT_JSON** chưa được cấu hình trên server.\n" +
-          "Vào Firebase Console → Project settings → Service accounts → Generate new private key → đặt vào biến môi trường `FIREBASE_SERVICE_ACCOUNT_JSON`."
+          "Vào Firebase Console → Project settings → Service accounts → Generate new private key → đặt vào biến môi trường `FIREBASE_SERVICE_ACCOUNT_JSON`.\n" +
+          "Thông báo vẫn có thể gửi qua `/thongbao` (sẽ lưu lại và hiện trong app khi mở lên, dù không có push tức thời)."
         );
         return;
       }
 
-      // Lấy tất cả FCM token
-      const rows = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
+      const { notif, fcm } = await createAndBroadcastNotification({
+        title, body, sentBy: interaction.user.tag, imageUrl, linkUrl: link,
+      });
 
-      if (rows.length === 0) {
+      const result = fcm ?? { total: 0, sent: 0, failed: 0 };
+
+      if (result.total === 0) {
         await interaction.editReply(
-          "📭 Chưa có thiết bị nào đăng ký nhận push notification.\n" +
-          "Người dùng cần **cài app → đăng nhập key** để token được đăng ký tự động."
+          "📭 Chưa có thiết bị nào đăng ký nhận push tức thời — nhưng thông báo **đã được lưu** " +
+          `(ID: ${notif.id}) và sẽ hiện trong icon chuông của mọi người khi họ mở app (kể cả người mới cài).\n` +
+          "Để nhận push tức thời, người dùng cần **cài app → đăng nhập key** để token được đăng ký tự động."
         );
         return;
-      }
-
-      const allTokens = rows.map(r => r.fcmToken);
-
-      // Gửi qua FCM v1 API
-      const result = await sendFcmPush(allTokens, title, body);
-
-      // Dọn token hết hạn khỏi DB
-      if (result.invalidTokens.length > 0) {
-        await db.delete(fcmTokensTable)
-          .where(inArray(fcmTokensTable.fcmToken, result.invalidTokens))
-          .catch(() => {});
       }
 
       const embed = new EmbedBuilder()
         .setColor(result.sent > 0 ? 0x00e676 : 0xff5722)
         .setTitle("📲 Push Notification Đã Gửi")
+        .setDescription("Đã lưu vào lịch sử (icon chuông cho mọi thiết bị cũ/mới) **và** đẩy push tức thời tới thiết bị online.")
         .addFields(
           { name: "📌 Tiêu đề",          value: title,                    inline: false },
           { name: "📝 Nội dung",          value: body,                     inline: false },
+          ...(imageUrl ? [{ name: "🖼️ Ảnh", value: imageUrl, inline: false }] : []),
+          ...(link ? [{ name: "🔗 Link", value: link, inline: false }] : []),
           { name: "📱 Tổng thiết bị",     value: `${result.total}`,        inline: true  },
           { name: "✅ Gửi thành công",    value: `${result.sent}`,         inline: true  },
           { name: "❌ Thất bại",          value: `${result.failed}`,       inline: true  },
-          ...(result.invalidTokens.length > 0
-            ? [{ name: "🗑️ Token đã xóa", value: `${result.invalidTokens.length} token hết hạn`, inline: true }]
-            : []),
-          ...(result.error
-            ? [{ name: "⚠️ Lỗi", value: result.error, inline: false }]
-            : []),
         )
-        .setFooter({ text: `Gửi bởi ${interaction.user.tag}` })
+        .setFooter({ text: `ID: ${notif.id} · Gửi bởi ${interaction.user.tag}` })
         .setTimestamp();
 
       await interaction.editReply({ embeds: [embed] });

@@ -1,8 +1,9 @@
 import { Router, type IRouter } from "express";
 import { eq, and, sql, inArray } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable } from "../db/index.js";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, fcmTokensTable } from "../db/index.js";
 import { logger } from "../lib/logger.js";
 import { sendDiscordLog } from "../lib/discord-bot.js";
+import { sendFcmPush, isFcmConfigured } from "../lib/fcm.js";
 import https from "https";
 import http from "http";
 
@@ -96,19 +97,69 @@ function createLink4mUrl(targetUrl: string): Promise<string> {
 }
 
 // ── Lấy thông báo chưa đọc ───────────────────────────────────────────────
+// LƯU Ý: đây chính là cơ chế đồng bộ "server-authoritative" — mọi thiết bị
+// (cả thiết bị vừa cài app sau khi thông báo đã được gửi) đều nhận đủ TOÀN BỘ
+// lịch sử thông báo mà nó chưa đọc, không phụ thuộc thời điểm cài app.
+export type PendingNotification = {
+  id: number; title: string; body: string;
+  imageUrl: string | null; linkUrl: string | null;
+};
+
 async function getPendingNotifications(deviceId: string) {
   const allNotifs = await db.select().from(notificationsTable).orderBy(notificationsTable.createdAt);
   const activeIds = allNotifs.map(n => n.id);
-  if (allNotifs.length === 0) return { pending: [] as { id: number; title: string; body: string }[], activeIds };
+  if (allNotifs.length === 0) return { pending: [] as PendingNotification[], activeIds };
 
   const reads = await db.select().from(notificationReadsTable)
     .where(and(eq(notificationReadsTable.deviceId, deviceId), inArray(notificationReadsTable.notificationId, activeIds)));
 
   const readIds = new Set(reads.map(r => r.notificationId));
-  const pending = allNotifs.filter(n => !readIds.has(n.id)).map(n => ({
+  const pending: PendingNotification[] = allNotifs.filter(n => !readIds.has(n.id)).map(n => ({
     id: n.id, title: n.title, body: n.body,
+    imageUrl: n.imageUrl ?? null, linkUrl: n.linkUrl ?? null,
   }));
   return { pending, activeIds };
+}
+
+// ── Gửi 1 thông báo: persist vào DB (lịch sử vĩnh viễn, mọi thiết bị cũ/mới
+// đều nhận qua heartbeat) + đẩy FCM tức thời tới thiết bị đang online (tốc độ).
+// Dùng chung cho /admin/notify (HTTP) và các slash command Discord.
+export async function createAndBroadcastNotification(opts: {
+  title: string; body: string; sentBy: string;
+  imageUrl?: string | null; linkUrl?: string | null;
+}) {
+  const [notif] = await db.insert(notificationsTable).values({
+    title: opts.title,
+    body: opts.body,
+    sentBy: opts.sentBy,
+    imageUrl: opts.imageUrl ?? null,
+    linkUrl: opts.linkUrl ?? null,
+  }).returning();
+
+  let fcm: { total: number; sent: number; failed: number } | null = null;
+  if (isFcmConfigured()) {
+    try {
+      const rows = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
+      const tokens = rows.map(r => r.fcmToken);
+      if (tokens.length > 0) {
+        const result = await sendFcmPush(tokens, opts.title, opts.body, {
+          notifId: notif.id,
+          imageUrl: opts.imageUrl ?? undefined,
+          link: opts.linkUrl ?? undefined,
+        });
+        fcm = { total: result.total, sent: result.sent, failed: result.failed };
+        if (result.invalidTokens.length > 0) {
+          await db.delete(fcmTokensTable)
+            .where(inArray(fcmTokensTable.fcmToken, result.invalidTokens))
+            .catch(() => {});
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, "createAndBroadcastNotification: FCM push failed");
+    }
+  }
+
+  return { notif, fcm };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1319,19 +1370,20 @@ router.post("/keys/logout", async (req, res): Promise<void> => {
 });
 
 // ── Admin: Gửi thông báo đến tất cả người dùng ───────────────────────────────
+// Giờ đây persist vào DB (mọi thiết bị cũ/mới đều thấy qua heartbeat) VÀ đẩy
+// FCM tức thời (thiết bị đang online nhận trong vài giây) — không còn tách
+// biệt 2 đường như trước.
 router.post("/admin/notify", requireAdmin, async (req, res): Promise<void> => {
-  const { title, body, sentBy } = req.body;
+  const { title, body, sentBy, imageUrl, linkUrl } = req.body;
   if (!title || !body) {
     res.status(400).json({ ok: false, error: "title và body là bắt buộc" });
     return;
   }
-  const [notif] = await db.insert(notificationsTable).values({
-    title,
-    body,
-    sentBy: sentBy ?? "admin",
-  }).returning();
-  req.log.info({ notifId: notif.id }, "Notification sent");
-  res.json({ ok: true, id: notif.id, title, body });
+  const { notif, fcm } = await createAndBroadcastNotification({
+    title, body, sentBy: sentBy ?? "admin", imageUrl, linkUrl,
+  });
+  req.log.info({ notifId: notif.id, fcm }, "Notification sent");
+  res.json({ ok: true, id: notif.id, title, body, fcm });
 });
 
 // ── Admin: CRUD keys (hỗ trợ phân trang, không giới hạn 20) ──────────────────
