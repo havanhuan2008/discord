@@ -1,4 +1,4 @@
-import { pgTable, text, serial, timestamp, integer } from "drizzle-orm/pg-core";
+import { pgTable, text, serial, timestamp, integer, boolean } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 import { keysTable } from "./keys";
@@ -13,6 +13,10 @@ export const devicesTable = pgTable("devices", {
   deviceRam:  text("device_ram").notNull().default(""),
   lastSeen:   timestamp("last_seen",   { withTimezone: true }).notNull().defaultNow(),
   createdAt:  timestamp("created_at",  { withTimezone: true }).notNull().defaultNow(),
+  // is_active: false = đã logout (slot vẫn bị giữ), true = đang đăng nhập
+  // KHÔNG xóa record khi logout — thiết bị đã chiếm slot thì giữ slot mãi
+  isActive:   boolean("is_active").notNull().default(true),
+  loggedOutAt: timestamp("logged_out_at", { withTimezone: true }),
 });
 
 export const insertDeviceSchema = createInsertSchema(devicesTable).omit({ id: true, createdAt: true });

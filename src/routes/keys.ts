@@ -596,10 +596,11 @@ router.get("/keys/claim-free", async (req, res): Promise<void> => {
   }).returning();
 
   await db.insert(devicesTable).values({
-    keyId: keyRow.id,
+    keyId:      keyRow.id,
     deviceId,
     deviceName,
-    lastSeen: new Date(),
+    lastSeen:   new Date(),
+    isActive:   true,
   });
 
   req.log.info({ key: newKey, deviceId }, "Free key created via Link4m");
@@ -1009,34 +1010,39 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
     return;
   }
 
+  // Lấy TẤT CẢ devices đã từng đăng ký key này (kể cả đã logout — is_active=false)
+  // Slot một khi đã bị chiếm thì giữ mãi, không giải phóng khi logout.
   const existingDevices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
   const thisDevice = existingDevices.find(d => d.deviceId === deviceId);
+  const activeDevices = existingDevices.filter(d => d.isActive);
 
   if (!thisDevice) {
+    // deviceId này chưa từng đăng ký với key này
     if (existingDevices.length >= record.maxDevices) {
-      // ── Kiểm tra cài lại app trên cùng thiết bị vật lý ─────────────────────
-      // Khi user xóa app và cài lại, deviceId (UUID cũ) bị mất nhưng thông tin
-      // phần cứng (deviceName, deviceOs, deviceSdk) không đổi.
-      // Nếu tìm thấy thiết bị cũ có cùng model + OS + SDK → cập nhật deviceId mới
-      // thay vì block (chỉ áp dụng khi deviceName không phải "Unknown").
-      const sameHardware = (deviceName && deviceName !== "Unknown")
+      // ── Tất cả slot đã bị chiếm (dù có device đang offline/đã logout) ──────
+      // Chỉ cho phép nếu chính xác là cùng thiết bị vật lý cài lại app
+      // (deviceId bị xóa khi uninstall nhưng hardware info không đổi).
+      // ĐÃ THẮT CHẶT: yêu cầu khớp đủ 4 trường gồm cả RAM để tránh bypass.
+      const sameHardware = (deviceName && deviceName !== "Unknown" && deviceOs && deviceSdk)
         ? existingDevices.find(d =>
             d.deviceName === deviceName &&
-            d.deviceOs   === (deviceOs ?? "") &&
-            Number(d.deviceSdk) === Number(deviceSdk ?? 0)
+            d.deviceOs   === deviceOs &&
+            Number(d.deviceSdk) === Number(deviceSdk) &&
+            d.deviceRam  === (deviceRam ?? d.deviceRam) // RAM khớp hoặc không gửi RAM
           )
         : undefined;
 
       if (sameHardware) {
-        // Cùng thiết bị cài lại → cập nhật deviceId mới, giữ nguyên slot
+        // Cùng thiết bị vật lý cài lại → cập nhật deviceId mới, kích hoạt lại slot
         await db.update(devicesTable)
           .set({
             deviceId,
-            lastSeen:   new Date(),
-            deviceRam:  deviceRam ?? sameHardware.deviceRam ?? "",
+            lastSeen:    new Date(),
+            isActive:    true,
+            loggedOutAt: null,
+            deviceRam:   deviceRam ?? sameHardware.deviceRam ?? "",
           })
           .where(eq(devicesTable.id, sameHardware.id));
-        // Ghi log để admin biết
         sendDiscordLog({
           event:      "KEY_REINSTALL",
           key:        record.key,
@@ -1052,13 +1058,17 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
           note:       record.note,
         }).catch(() => {});
       } else {
+        // Thiết bị khác cố gắng chiếm slot — chặn dứt khoát.
+        // Kể cả khi thiết bị gốc đã logout, slot vẫn thuộc về thiết bị đó.
+        const occupiedByOther = existingDevices.filter(d => d.deviceId !== deviceId);
         res.status(200).json({
           ok: false,
-          message: `Key đã đăng nhập trên ${existingDevices.length}/${record.maxDevices} thiết bị. Liên hệ admin.`
+          message: `Key này đã được đăng ký cho ${occupiedByOther.length}/${record.maxDevices} thiết bị khác. Liên hệ admin để thêm slot hoặc chuyển thiết bị.`,
         });
         return;
       }
     } else {
+      // Còn slot trống → đăng ký thiết bị mới
       await db.insert(devicesTable).values({
         keyId:      record.id,
         deviceId,
@@ -1067,16 +1077,20 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
         deviceSdk:  Number(deviceSdk  ?? 0),
         deviceRam:  deviceRam  ?? "",
         lastSeen:   new Date(),
+        isActive:   true,
       });
     }
   } else {
+    // Thiết bị đã biết (kể cả đã logout trước đó) → cho đăng nhập lại, kích hoạt slot
     await db.update(devicesTable)
       .set({
-        lastSeen:   new Date(),
-        deviceName: deviceName ?? thisDevice.deviceName,
-        deviceOs:   deviceOs   ?? thisDevice.deviceOs   ?? "",
-        deviceSdk:  Number(deviceSdk  ?? thisDevice.deviceSdk ?? 0),
-        deviceRam:  deviceRam  ?? thisDevice.deviceRam  ?? "",
+        lastSeen:    new Date(),
+        isActive:    true,
+        loggedOutAt: null,
+        deviceName:  deviceName ?? thisDevice.deviceName,
+        deviceOs:    deviceOs   ?? thisDevice.deviceOs   ?? "",
+        deviceSdk:   Number(deviceSdk  ?? thisDevice.deviceSdk ?? 0),
+        deviceRam:   deviceRam  ?? thisDevice.deviceRam  ?? "",
       })
       .where(eq(devicesTable.id, thisDevice.id));
   }
@@ -1088,7 +1102,7 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
 
   req.log.info({ key: record.key }, "Key validated successfully");
 
-  // Gửi thông báo Discord khi ai đó đăng nhập key
+  const isNewDevice = !thisDevice;
   sendDiscordLog({
     event:      "KEY_LOGIN",
     key:        record.key,
@@ -1099,11 +1113,13 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
     deviceSdk:  Number(deviceSdk ?? 0),
     deviceRam:  deviceRam ?? "",
     expiresAt:  expiresAt,
-    isNewDevice: !thisDevice,
+    isNewDevice,
     label:      record.label,
     note:       record.note,
   }).catch(() => {});
 
+  // deviceCount = số thiết bị active (đang hoặc vừa đăng nhập)
+  const newActiveCount = activeDevices.filter(d => d.deviceId !== deviceId).length + 1;
   res.json({
     ok: true,
     key: record.key,
@@ -1113,7 +1129,7 @@ router.post("/keys/validate", async (req, res): Promise<void> => {
     expiresAt: expiresAt?.toISOString() ?? null,
     daysLeft,
     maxDevices: record.maxDevices,
-    deviceCount: existingDevices.length + (thisDevice ? 0 : 1),
+    deviceCount: newActiveCount,
   });
 });
 
@@ -1206,22 +1222,25 @@ router.post("/keys/heartbeat", async (req, res): Promise<void> => {
     }).catch(() => {});
   }
 
-  // Cập nhật lastSeen + device info trong DB
+  // Cập nhật lastSeen + device info trong DB, đồng thời đảm bảo is_active=true
   await db.update(devicesTable)
     .set({
-      lastSeen:   new Date(),
-      deviceName: currentDeviceName,
-      deviceOs:   currentDeviceOs,
-      deviceSdk:  currentDeviceSdk,
-      deviceRam:  currentDeviceRam,
+      lastSeen:    new Date(),
+      isActive:    true,
+      loggedOutAt: null,
+      deviceName:  currentDeviceName,
+      deviceOs:    currentDeviceOs,
+      deviceSdk:   currentDeviceSdk,
+      deviceRam:   currentDeviceRam,
     })
     .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
 
   // Lấy thông báo chưa đọc + danh sách id còn tồn tại (để client dọn thông báo đã bị xoá)
   const { pending, activeIds } = await getPendingNotifications(deviceId);
+  // Chỉ đếm thiết bị đang active (is_active=true)
   const deviceCount = await db.select({ count: sql<number>`count(*)` })
     .from(devicesTable)
-    .where(eq(devicesTable.keyId, record.id));
+    .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.isActive, true)));
 
   res.json({
     ok: true,
@@ -1266,12 +1285,19 @@ router.post("/keys/logout", async (req, res): Promise<void> => {
 
   const [record] = await db.select().from(keysTable).where(eq(keysTable.key, key));
   if (record) {
-    // Lấy thông tin thiết bị trước khi xóa để gửi thông báo Discord
     const [deviceRow] = await db.select().from(devicesTable)
       .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
 
-    await db.delete(devicesTable)
-      .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
+    // ── FIX: SOFT DELETE — KHÔNG xóa record device khi logout ────────────────
+    // Nếu xóa record, slot trở nên trống và ngày hôm sau thiết bị khác có thể
+    // chiếm slot đó → đây là nguyên nhân bug "ngày hôm sau máy khác đăng nhập được".
+    // Thay vào đó: đánh dấu is_active=false. Slot vẫn thuộc về thiết bị này.
+    // Thiết bị đã logout vẫn có thể đăng nhập lại bằng cùng deviceId đó.
+    if (deviceRow) {
+      await db.update(devicesTable)
+        .set({ isActive: false, loggedOutAt: new Date() })
+        .where(and(eq(devicesTable.keyId, record.id), eq(devicesTable.deviceId, deviceId)));
+    }
 
     // Xóa khỏi online map và gửi thông báo offline lên Discord
     const prevOnline = deviceOnlineMap.get(deviceId);
@@ -1465,11 +1491,21 @@ router.delete("/admin/keys/:id", requireAdmin, async (req, res): Promise<void> =
   res.json({ ok: true });
 });
 
+// Admin xóa cứng một device (giải phóng slot hoàn toàn — chỉ admin mới được làm)
 router.delete("/admin/keys/:id/devices/:deviceId", requireAdmin, async (req, res): Promise<void> => {
   const keyId = parseInt(req.params.id as string, 10);
   const devId = parseInt(req.params.deviceId as string, 10);
   await db.delete(devicesTable).where(and(eq(devicesTable.keyId, keyId), eq(devicesTable.id, devId)));
   res.json({ ok: true });
+});
+
+// Admin reset TẤT CẢ devices của một key (giải phóng toàn bộ slot)
+router.delete("/admin/keys/:id/devices", requireAdmin, async (req, res): Promise<void> => {
+  const keyId = parseInt(req.params.id as string, 10);
+  const [{ count }] = await db.select({ count: sql<number>`count(*)` })
+    .from(devicesTable).where(eq(devicesTable.keyId, keyId));
+  await db.delete(devicesTable).where(eq(devicesTable.keyId, keyId));
+  res.json({ ok: true, deleted: Number(count) });
 });
 
 // ── Admin: Quản lý thông báo (danh sách + xóa) ───────────────────────────────
@@ -1516,7 +1552,9 @@ router.delete("/admin/notifications", requireAdmin, async (req, res): Promise<vo
 router.get("/admin/stats", requireAdmin, async (req, res): Promise<void> => {
   const [{ total }] = await db.select({ total: sql<number>`count(*)` }).from(keysTable);
   const [{ active }] = await db.select({ active: sql<number>`count(*)` }).from(keysTable).where(eq(keysTable.isActive, true));
-  const [{ devices }] = await db.select({ devices: sql<number>`count(*)` }).from(devicesTable);
+  // Chỉ đếm devices đang active (is_active=true)
+  const [{ devices }] = await db.select({ devices: sql<number>`count(*)` })
+    .from(devicesTable).where(eq(devicesTable.isActive, true));
   const [{ vip }] = await db.select({ vip: sql<number>`count(*)` }).from(keysTable).where(and(eq(keysTable.isActive, true), eq(keysTable.tier, "vip")));
 
   const now = new Date();
