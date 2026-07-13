@@ -33,26 +33,8 @@ function getProjectId(): string {
 }
 
 // ─── Lấy OAuth2 access token từ service account ──────────────────────────────
-// ── FIX TỐC ĐỘ: cache access token trong RAM (token FCM sống ~1h). Trước đây
-//    mỗi lần gửi push đều tạo JWT + gọi Google OAuth để lấy token mới, tốn
-//    thêm 300-800ms mỗi lần bấm /thongbaodaybp — đây là nguyên nhân chính khiến
-//    thông báo "gửi chậm". Giờ chỉ làm mới khi token cũ sắp hết hạn.
-let cachedAccessToken: string | null = null;
-let cachedTokenExpiryMs = 0;
-const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000; // làm mới sớm 5 phút trước khi hết hạn
 
 async function getAccessToken(): Promise<string> {
-  const now = Date.now();
-  if (cachedAccessToken && now < cachedTokenExpiryMs - TOKEN_REFRESH_MARGIN_MS) {
-    return cachedAccessToken;
-  }
-  const token = await fetchFreshAccessToken();
-  cachedAccessToken = token;
-  cachedTokenExpiryMs = now + 3600 * 1000; // token FCM luôn có hạn 3600s
-  return token;
-}
-
-async function fetchFreshAccessToken(): Promise<string> {
   const sa = getServiceAccount();
   if (!sa) throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON chưa được cấu hình");
 
@@ -125,41 +107,15 @@ async function fetchFreshAccessToken(): Promise<string> {
 
 // ─── Gửi một message FCM v1 ───────────────────────────────────────────────────
 
-export interface FcmExtras {
-  notifId?:  number;
-  imageUrl?: string;
-  link?:     string;
-}
-
 async function sendOne(
   token: string,
   title: string,
   body:  string,
   accessToken: string,
   projectId:   string,
-  extras: FcmExtras = {},
 ): Promise<"ok" | "invalid_token" | "error"> {
   try {
     const url = `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`;
-
-    // ── "Hầm hố": ảnh lớn (BigPictureStyle) + màu accent đỏ tối + data payload
-    //    để client lưu ngay vào lịch sử (NotificationStore) và mở link khi bấm.
-    const androidNotification: Record<string, unknown> = {
-      sound:      "default",
-      channel_id: "aujunpeak_push",   // phải khớp CHANNEL_ID trong MyFirebaseMessagingService.kt
-      color:      "#B00020",
-      notification_priority: "PRIORITY_MAX",
-      visibility: "PUBLIC",
-    };
-    if (extras.imageUrl) androidNotification.image = extras.imageUrl;
-
-    const data: Record<string, string> = {};
-    if (extras.notifId != null) data.notifId = String(extras.notifId);
-    if (extras.imageUrl) data.imageUrl = extras.imageUrl;
-    if (extras.link) data.link = extras.link;
-    data.title = title;
-    data.body = body;
-
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -169,16 +125,14 @@ async function sendOne(
       body: JSON.stringify({
         message: {
           token,
-          notification: {
-            title,
-            body,
-            ...(extras.imageUrl ? { image: extras.imageUrl } : {}),
-          },
+          notification: { title, body },
           android: {
             priority: "high",
-            notification: androidNotification,
+            notification: {
+              sound:      "default",
+              channel_id: "aujunpeak_push",   // phải khớp CHANNEL_ID trong MyFirebaseMessagingService.kt
+            },
           },
-          data,
         },
       }),
     });
@@ -211,7 +165,6 @@ export async function sendFcmPush(
   tokens: string[],
   title:  string,
   body:   string,
-  extras: FcmExtras = {},
 ): Promise<FcmSendResult> {
   if (tokens.length === 0) {
     return { total: 0, sent: 0, failed: 0, invalidTokens: [] };
@@ -239,7 +192,7 @@ export async function sendFcmPush(
   for (let i = 0; i < tokens.length; i += CONCURRENCY) {
     const batch   = tokens.slice(i, i + CONCURRENCY);
     const results = await Promise.all(
-      batch.map(t => sendOne(t, title, body, accessToken, projectId, extras)),
+      batch.map(t => sendOne(t, title, body, accessToken, projectId)),
     );
     results.forEach((r, idx) => {
       if (r === "ok")            sent++;

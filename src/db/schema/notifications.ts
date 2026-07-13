@@ -8,10 +8,6 @@ export const notificationsTable = pgTable("notifications", {
   title: text("title").notNull(),
   body: text("body").notNull(),
   sentBy: text("sent_by").notNull().default("admin"),
-  // ── Thông báo nâng cấp: ảnh minh họa + link đính kèm (hiển thị BigPictureStyle
-  // trên push, và thumbnail + nút "Mở liên kết" trong lịch sử app) ─────────────
-  imageUrl: text("image_url"),
-  linkUrl: text("link_url"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
