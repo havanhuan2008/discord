@@ -552,7 +552,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const record = await findKey(keyStr);
       if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
-      const devs = await db.select().from(devicesTable).where(eq(devicesTable.key, keyStr));
+      const devs = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
       const exp  = record.expiresAt ? formatDate(record.expiresAt) : "Vĩnh viễn";
       const embed = new EmbedBuilder()
         .setColor(record.isActive ? 0x00e676 : 0xff5252)
@@ -672,7 +672,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const record = await findKey(keyStr);
       if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
       // Xóa device liên quan trước
-      await db.delete(devicesTable).where(eq(devicesTable.key, keyStr));
+      await db.delete(devicesTable).where(eq(devicesTable.keyId, record.id));
       await db.delete(keysTable).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
         .setColor(0xf44336)
@@ -707,13 +707,14 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const record = await findKey(keyStr);
       if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
       const devs = await db.select().from(devicesTable)
-        .where(and(eq(devicesTable.key, keyStr), eq(devicesTable.isDeleted, false)));
+        .where(eq(devicesTable.keyId, record.id))
+        .orderBy(devicesTable.id);
       if (devs.length === 0) {
         await interaction.editReply(`📭 Key \`${keyStr}\` chưa có thiết bị nào đăng nhập.`);
         return;
       }
       const lines = devs.map((d, i) =>
-        `**${i + 1}.** 📱 ${d.deviceName} · \`${d.deviceId.slice(0, 16)}…\` · Lần cuối: ${formatDate(d.lastSeen)}`
+        `**${i + 1}.** ${d.isActive ? "🟢" : "⚪"} ${d.deviceName} · \`${d.deviceId.slice(0, 16)}…\` · Lần cuối: ${formatDate(d.lastSeen)}${d.isActive ? "" : " · đã đăng xuất (vẫn chiếm slot)"}`
       );
       const embed = new EmbedBuilder()
         .setColor(0x7c4dff)
@@ -730,16 +731,17 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const record = await findKey(keyStr);
       if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
       const devs = await db.select().from(devicesTable)
-        .where(and(eq(devicesTable.key, keyStr), eq(devicesTable.isDeleted, false)));
+        .where(eq(devicesTable.keyId, record.id))
+        .orderBy(devicesTable.id);
       const idx  = stt - 1;
       if (idx < 0 || idx >= devs.length) {
         await interaction.editReply(`❌ STT ${stt} không hợp lệ (key có ${devs.length} thiết bị).`);
         return;
       }
       const target = devs[idx];
-      await db.update(devicesTable)
-        .set({ isDeleted: true })
-        .where(eq(devicesTable.id, target.id));
+      // Xóa vĩnh viễn record để giải phóng slot thiết bị (soft-logout không đủ vì
+      // slot bị giữ mãi cho tới khi admin xóa hẳn — xem README_BUGFIX_DEVICE_LIMIT.md)
+      await db.delete(devicesTable).where(eq(devicesTable.id, target.id));
       const embed = new EmbedBuilder()
         .setColor(0xff9800)
         .setTitle("🗑️ Đã xóa thiết bị")
@@ -754,7 +756,7 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
     } else if (cmd === "thongke") {
       const [allKeys, allDevs] = await Promise.all([
         db.select().from(keysTable),
-        db.select().from(devicesTable).where(eq(devicesTable.isDeleted, false)),
+        db.select().from(devicesTable),
       ]);
       const now     = new Date();
       const active  = allKeys.filter(k => k.isActive && !(k.expiresAt && k.expiresAt < now));
@@ -779,11 +781,13 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
     // ── /online ──────────────────────────────────────────────────────────────
     } else if (cmd === "online") {
       const result = await db.execute(
-        sql`SELECT device_id, device_name, "key", tier, device_os, device_sdk, device_ram, last_seen
-            FROM devices
-            WHERE is_deleted = false
-              AND last_seen > NOW() - INTERVAL '5 minutes'
-            ORDER BY last_seen DESC
+        sql`SELECT d.device_id, d.device_name, k."key" AS key, k.tier AS tier,
+                   d.device_os, d.device_sdk, d.device_ram, d.last_seen
+            FROM devices d
+            JOIN keys k ON k.id = d.key_id
+            WHERE d.is_active = true
+              AND d.last_seen > NOW() - INTERVAL '5 minutes'
+            ORDER BY d.last_seen DESC
             LIMIT 30`
       );
       const rows = (result as any).rows ?? [];
@@ -903,12 +907,14 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       }
 
       // Xác nhận bằng buttons
+      const rawLabel = filterDisplayLabel(filter).replace(/^·\s*/, "");
+      const filterSuffix = rawLabel ? ` (${rawLabel})` : "";
       const confirmRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId("bulk_confirm").setLabel(`⚠️ Xóa ${count} key`).setStyle(ButtonStyle.Danger),
         new ButtonBuilder().setCustomId("bulk_cancel").setLabel("Hủy").setStyle(ButtonStyle.Secondary),
       );
       const msg = await interaction.editReply({
-        content: `⚠️ **Xác nhận xóa ${count} key** (${filterDisplayLabel(filter)})?\nHành động này **không thể hoàn tác**.`,
+        content: `⚠️ **Xác nhận xóa ${count} key${filterSuffix}**?\nHành động này **không thể hoàn tác**.`,
         components: [confirmRow],
       });
 
@@ -920,8 +926,9 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       });
       collector.on("collect", async (btn: ButtonInteraction) => {
         if (btn.customId === "bulk_confirm") {
-          const ids = allKeys.map(k => k.key);
-          await db.delete(devicesTable).where(inArray(devicesTable.key, ids));
+          const ids    = allKeys.map(k => k.key);
+          const keyIds = allKeys.map(k => k.id);
+          await db.delete(devicesTable).where(inArray(devicesTable.keyId, keyIds));
           await db.delete(keysTable).where(inArray(keysTable.key, ids));
           await btn.update({ content: `✅ Đã xóa **${count} key** thành công.`, components: [] });
         } else {
@@ -1091,11 +1098,11 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
       const batchSize = 500;
 
       for (let i = 0; i < tokens.length; i += batchSize) {
-        const batch = tokens.slice(i, i + batchSize).map(t => t.token);
+        const batch = tokens.slice(i, i + batchSize).map(t => t.fcmToken);
         try {
-          const result = await sendFcmPush({ tokens: batch, title, body });
-          successCount += result.successCount ?? 0;
-          failCount    += result.failureCount ?? 0;
+          const result = await sendFcmPush(batch, title, body);
+          successCount += result.sent   ?? 0;
+          failCount    += result.failed ?? 0;
         } catch (err) {
           logger.error({ err }, "FCM batch push error");
           failCount += batch.length;
@@ -1267,7 +1274,9 @@ export type DiscordLogEvent =
   | "KEY_OFFLINE"        // Thiết bị logout
   | "KEY_EXPIRED_HB"     // Key hết hạn được phát hiện qua heartbeat
   | "KEY_REVOKED_HB"     // Key bị thu hồi được phát hiện qua heartbeat
-  | "GOOGLE_LOGIN";      // Người dùng đăng nhập Google thành công từ app
+  | "KEY_REINSTALL"      // Thiết bị cùng phần cứng cài lại app, slot được kích hoạt lại
+  | "GOOGLE_LOGIN"       // Người dùng đăng nhập Google thành công từ app
+  | "FEEDBACK";          // Người dùng gửi báo lỗi / góp ý / liên hệ từ app
 
 export interface DiscordLogPayload {
   event:          DiscordLogEvent;
@@ -1302,6 +1311,8 @@ function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: str
     case "KEY_EXPIRED_HB":   return { color: 0xFF5722, icon: "⛔", title: "Key Hết Hạn (Phát Hiện)" };
     case "KEY_REVOKED_HB":   return { color: 0xF44336, icon: "🔒", title: "Key Bị Thu Hồi (Phát Hiện)" };
     case "GOOGLE_LOGIN":     return { color: 0x4285F4, icon: "🔵", title: "Đăng Nhập Google" };
+    case "KEY_REINSTALL":    return { color: 0x00ACC1, icon: "🔄", title: "Thiết Bị Cài Lại (Cùng Phần Cứng)" };
+    case "FEEDBACK":         return { color: 0xFFAB00, icon: "📩", title: "Phản Hồi Từ Người Dùng" };
     default:                 return { color: 0x00E5FF, icon: "📩", title: "Sự Kiện" };
   }
 }

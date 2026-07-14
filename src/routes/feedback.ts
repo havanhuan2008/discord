@@ -69,7 +69,7 @@ router.post("/feedback", async (req, res): Promise<void> => {
       contact:   contact   || undefined,
       starsStr,
       savedId,
-    } as Parameters<typeof sendDiscordLog>[0]);
+    });
   } catch (err) {
     logger.warn({ err }, "feedback: discord notify failed");
   }
