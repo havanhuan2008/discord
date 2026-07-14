@@ -968,9 +968,14 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
 
     // ── /chatchapnhan ─────────────────────────────────────────────────────────
     } else if (cmd === "chatchapnhan") {
-      const sessionId = interaction.options.getInteger("id", true);
+      const sessionId  = interaction.options.getInteger("id", true);
+      const adminName  = interaction.member && "displayName" in interaction.member
+        ? (interaction.member as { displayName: string }).displayName
+        : interaction.user.username;
+      const adminAvatar = interaction.user.displayAvatarURL();
+
       const result = await db.execute(
-        sql`UPDATE chat_sessions SET status = 'accepted', updated_at = NOW() WHERE id = ${sessionId} AND status = 'pending' RETURNING id, email, display_name`
+        sql`UPDATE chat_sessions SET status = 'accepted', admin_name = ${adminName}, admin_avatar = ${adminAvatar}, admin_online = true, updated_at = NOW() WHERE id = ${sessionId} AND status = 'pending' RETURNING id, email, display_name`
       );
       const rows = (result as any).rows ?? [];
       if (rows.length === 0) {
@@ -978,6 +983,16 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
         return;
       }
       const session = rows[0];
+
+      // Gửi tin nhắn chào tới app của người dùng (giống HTTP /chat/admin/accept)
+      // — nếu thiếu bước này, người dùng sẽ không thấy admin đã chấp nhận trong modal chat.
+      await db.insert(chatMessagesTable).values({
+        sessionId: Number(sessionId),
+        sender: "admin",
+        content: `✅ Admin **${adminName}** đã chấp nhận trò chuyện! Tôi sẽ hỗ trợ bạn ngay.`,
+        type: "text",
+      });
+
       const embed = new EmbedBuilder()
         .setColor(0x00e676)
         .setTitle(`✅ Đã chấp nhận phiên chat #${sessionId}`)
@@ -1039,8 +1054,18 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
     // ── /chatthoat ─────────────────────────────────────────────────────────────
     } else if (cmd === "chatthoat") {
       const sessionId = interaction.options.getInteger("id", true);
+
+      // Thông báo cho người dùng trong modal chat (giống HTTP /chat/admin/close) —
+      // thiếu bước này thì app không hiển thị gì khi admin đóng phiên chat.
+      await db.insert(chatMessagesTable).values({
+        sessionId: Number(sessionId),
+        sender: "bot",
+        content: "❌ Admin đã kết thúc phiên trò chuyện. Cảm ơn bạn đã liên hệ! Nếu cần hỗ trợ thêm, hãy bắt đầu cuộc trò chuyện mới.",
+        type: "text",
+      });
+
       await db.execute(
-        sql`UPDATE chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = ${sessionId}`
+        sql`UPDATE chat_sessions SET status = 'closed', admin_online = false, updated_at = NOW() WHERE id = ${sessionId}`
       );
 
       const embed = new EmbedBuilder()
