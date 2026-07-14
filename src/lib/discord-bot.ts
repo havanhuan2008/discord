@@ -14,7 +14,7 @@ import {
   PermissionFlagsBits,
 } from "discord.js";
 import { eq, and, sql, inArray } from "drizzle-orm";
-import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable, chatSessionsTable, chatMessagesTable } from "../db/index.js";
+import { db, keysTable, devicesTable, notificationsTable, notificationReadsTable, feedbacksTable, fcmTokensTable, chatSessionsTable, chatMessagesTable, appConfigTable } from "../db/index.js";
 import { logger } from "./logger.js";
 import { sendFcmPush, isFcmConfigured } from "./fcm.js";
 
@@ -317,6 +317,41 @@ const commands = [
     .addStringOption(o => o.setName("tieude").setDescription("Tiêu đề thông báo").setRequired(true))
     .addStringOption(o => o.setName("noidung").setDescription("Nội dung thông báo").setRequired(true))
     .toJSON(),
+
+  // ── Force Update ──────────────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("update")
+    .setDescription("🔄 Bật/tắt chế độ force update cho app")
+    .addStringOption(o =>
+      o.setName("trang_thai")
+        .setDescription("Bật hoặc tắt force update")
+        .setRequired(true)
+        .addChoices(
+          { name: "🟢 Bật (on) — bắt buộc cập nhật", value: "on"  },
+          { name: "🔴 Tắt (off) — cho vào app bình thường", value: "off" },
+        ))
+    .addIntegerOption(o =>
+      o.setName("phien_ban")
+        .setDescription("Version code tối thiểu bắt buộc (mặc định: giữ nguyên hiện tại)")
+        .setRequired(false))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("setdownloadurl")
+    .setDescription("🔗 Đặt link tải APK mới (hiển thị trên màn hình force update)")
+    .addStringOption(o =>
+      o.setName("url")
+        .setDescription("URL tải APK mới (vd: https://example.com/app-new.apk)")
+        .setRequired(true))
+    .toJSON(),
+
+  new SlashCommandBuilder()
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setName("statusupdate")
+    .setDescription("📊 Xem trạng thái hiện tại của force update")
+    .toJSON(),
 ];
 
 async function findKey(keyStr: string) {
@@ -401,6 +436,21 @@ function buildNotifListEmbed(
     .setTimestamp();
 }
 
+// ── Helper: đọc/ghi app_config ───────────────────────────────────────────────
+async function getAppConfig(): Promise<Record<string, string>> {
+  const configs = await db.select().from(appConfigTable);
+  const map: Record<string, string> = {};
+  for (const c of configs) map[c.key] = c.value;
+  return map;
+}
+
+async function setAppConfig(key: string, value: string): Promise<void> {
+  await db
+    .insert(appConfigTable)
+    .values({ key, value })
+    .onConflictDoUpdate({ target: appConfigTable.key, set: { value } });
+}
+
 async function handleInteraction(interaction: ChatInputCommandInteraction) {
   if (!isAuthorizedAdmin(interaction)) {
     await interaction.reply({
@@ -449,753 +499,541 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
           key,
           label,
           note,
+          tier,
           maxDevices: maxDev,
           expiresAt,
           discordUserId: interaction.user.id,
-          tier,
         }).returning();
-      } catch (err: any) {
-        if (err?.code === "23505") {
-          await interaction.editReply(`❌ Key \`${key}\` đã tồn tại (trùng lặp). Vui lòng thử lại.`);
-          return;
+      } catch (dbErr: any) {
+        if (dbErr?.code === "23505") {
+          await interaction.editReply(`❌ Key \`${key}\` đã tồn tại. Dùng lệnh không có --key để tự sinh ngẫu nhiên.`);
+        } else {
+          throw dbErr;
         }
-        throw err;
-      }
-
-      const embed = new EmbedBuilder()
-        .setColor(tier === "vip" ? 0xffd700 : 0x00bcd4)
-        .setTitle(`${tier === "vip" ? "👑" : "🆓"} Key đã được tạo${customKey ? " (tùy chỉnh)" : ""}`)
-        .addFields(
-          { name: "🔑 Key",        value: `\`${record.key}\``,            inline: false },
-          { name: "📛 Nhãn",       value: label || "—",                   inline: true  },
-          { name: "🎯 Loại",       value: tierBadge(tier),                inline: true  },
-          { name: "📅 Hết hạn",    value: formatDate(expiresAt),          inline: true  },
-          { name: "📱 Thiết bị",   value: `${maxDev}`,                    inline: true  },
-          { name: "📝 Ghi chú",    value: note || "—",                    inline: false },
-        )
-        .setTimestamp();
-      await interaction.editReply({ embeds: [embed] });
-    }
-
-    // ── /nangcap ─────────────────────────────────────────────────────────────
-    else if (cmd === "nangcap") {
-      const keyStr    = interaction.options.getString("key", true);
-      const tierInput = interaction.options.getString("loai", true).toLowerCase();
-
-      if (!["free", "vip"].includes(tierInput)) {
-        await interaction.editReply("❌ Loại phải là `free` hoặc `vip`.");
         return;
       }
 
-      const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-
-      await db.update(keysTable).set({ tier: tierInput }).where(eq(keysTable.id, record.id));
-
+      const exp = expiresAt ? formatDate(expiresAt) : "Vĩnh viễn";
       const embed = new EmbedBuilder()
-        .setColor(tierInput === "vip" ? 0xffd700 : 0x00bcd4)
-        .setTitle("🔄 Đã đổi tier key")
+        .setColor(tier === "vip" ? 0xffd700 : 0x00e676)
+        .setTitle(`🎉 Đã tạo key ${tierBadge(tier)}`)
         .addFields(
-          { name: "🔑 Key",    value: `\`${record.key}\``,  inline: false },
-          { name: "🎯 Tier mới", value: tierBadge(tierInput), inline: true  },
+          { name: "🗝️ Key",          value: `\`${key}\``,    inline: false },
+          { name: "📅 Hết hạn",       value: exp,             inline: true  },
+          { name: "📱 Max thiết bị",  value: `${maxDev}`,     inline: true  },
+          { name: "🏷️ Nhãn",          value: label || "—",    inline: true  },
+          { name: "📝 Ghi chú",       value: note  || "—",    inline: false },
         )
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
-    // ── /xemkey ──────────────────────────────────────────────────────────────
-    else if (cmd === "xemkey") {
-      const keyStr = interaction.options.getString("key", true);
+    // ── /nangcap ──────────────────────────────────────────────────────────────
+    } else if (cmd === "nangcap") {
+      const keyStr   = interaction.options.getString("key", true).trim().toUpperCase();
+      const tierInput = interaction.options.getString("loai", true).toLowerCase();
+      if (!["free", "vip"].includes(tierInput)) {
+        await interaction.editReply("❌ Tier phải là `free` hoặc `vip`.");
+        return;
+      }
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-
-      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
-
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      await db.update(keysTable).set({ tier: tierInput }).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
-        .setColor(record.isActive ? 0x00e676 : 0xff1744)
-        .setTitle(`${statusEmoji(record)} Key Info`)
+        .setColor(tierInput === "vip" ? 0xffd700 : 0x00e676)
+        .setTitle(`✅ Đã cập nhật tier`)
         .addFields(
-          { name: "🔑 Key",      value: `\`${record.key}\``,                    inline: false },
-          { name: "📛 Nhãn",     value: record.label || "—",                    inline: true  },
-          { name: "🎯 Tier",     value: tierBadge(record.tier),                 inline: true  },
-          { name: "📅 Hết hạn",  value: formatDate(record.expiresAt),           inline: true  },
-          { name: "📱 Thiết bị", value: `${devices.length}/${record.maxDevices}`, inline: true  },
-          { name: "📝 Ghi chú",  value: record.note || "—",                     inline: false },
-        )
-        .setTimestamp();
+          { name: "🗝️ Key",  value: `\`${keyStr}\``,    inline: false },
+          { name: "⭐ Tier", value: tierBadge(tierInput), inline: true  },
+        ).setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
+
+    // ── /xemkey ───────────────────────────────────────────────────────────────
+    } else if (cmd === "xemkey") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
+      const record = await findKey(keyStr);
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      const devs = await db.select().from(devicesTable).where(eq(devicesTable.key, keyStr));
+      const exp  = record.expiresAt ? formatDate(record.expiresAt) : "Vĩnh viễn";
+      const embed = new EmbedBuilder()
+        .setColor(record.isActive ? 0x00e676 : 0xff5252)
+        .setTitle(`🗝️ Chi tiết key`)
+        .addFields(
+          { name: "Key",           value: `\`${record.key}\``,                    inline: false },
+          { name: "Trạng thái",    value: statusEmoji(record) + " " + (record.isActive ? "Hoạt động" : "Đã khóa"), inline: true },
+          { name: "Tier",          value: tierBadge(record.tier),                  inline: true  },
+          { name: "Hết hạn",       value: exp,                                    inline: true  },
+          { name: "Nhãn",          value: record.label || "—",                    inline: true  },
+          { name: "Max thiết bị",  value: `${record.maxDevices}`,                 inline: true  },
+          { name: "Đang đăng nhập",value: `${devs.length}`,                       inline: true  },
+          { name: "Ghi chú",       value: record.note || "—",                     inline: false },
+          { name: "Tạo lúc",       value: formatDate(record.createdAt),            inline: true  },
+        ).setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
 
     // ── /danhsachkey ─────────────────────────────────────────────────────────
-    else if (cmd === "danhsachkey") {
-      const filter = interaction.options.getString("loc") ?? "all";
-      const keys = await fetchKeysForFilter(filter);
+    } else if (cmd === "danhsachkey") {
+      const filter   = interaction.options.getString("loc") ?? "all";
+      const allKeys  = await fetchKeysForFilter(filter);
+      const total    = allKeys.length;
+      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      const label    = filterDisplayLabel(filter);
+      let page = 0;
+      const embed = buildKeyListEmbed(allKeys, page, totalPages, total, label);
 
-      if (keys.length === 0) {
-        await interaction.editReply("📭 Không có key phù hợp.");
+      if (totalPages <= 1) {
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
-      let totalPages = Math.max(1, Math.ceil(keys.length / PAGE_SIZE));
-      let page = 0;
+      const prefix = `keylist:${Date.now()}`;
+      const row    = paginationRow(page, totalPages, prefix);
+      const msg    = await interaction.editReply({ embeds: [embed], components: [row] });
 
-      const embed = buildKeyListEmbed(keys, page, totalPages, keys.length, filterDisplayLabel(filter));
-      const components = totalPages > 1 ? [paginationRow(page, totalPages, "keylist")] : [];
-
-      const message = await interaction.editReply({ embeds: [embed], components });
-      if (totalPages <= 1) return;
-
-      const collector = message.createMessageComponentCollector({
+      const collector = msg.createMessageComponentCollector({
         componentType: ComponentType.Button,
-        time: 5 * 60 * 1000,
+        filter: (btn: ButtonInteraction) => btn.user.id === interaction.user.id && btn.customId.startsWith(prefix),
+        time: 5 * 60_000,
       });
 
-      let busy = false;
       collector.on("collect", async (btn: ButtonInteraction) => {
-        if (btn.user.id !== interaction.user.id) {
-          await btn.reply({ content: "❌ Bạn không thể điều khiển danh sách này.", flags: 64 });
-          return;
-        }
-        // Chặn click liên tiếp trong khi request trước đang xử lý, tránh cập nhật trang lệch thứ tự.
-        if (busy) {
-          await btn.deferUpdate().catch(() => {});
-          return;
-        }
-        busy = true;
-        try {
-          const [, action] = btn.customId.split(":");
-          if (action === "first") page = 0;
-          else if (action === "prev") page = Math.max(0, page - 1);
-          else if (action === "next") page = Math.min(totalPages - 1, page + 1);
-          else if (action === "last") page = totalPages - 1;
-
-          const freshKeys = await fetchKeysForFilter(filter);
-          const newTotalPages = Math.max(1, Math.ceil(freshKeys.length / PAGE_SIZE));
-          page = Math.min(page, newTotalPages - 1);
-          totalPages = newTotalPages;
-
-          const newEmbed = buildKeyListEmbed(freshKeys, page, newTotalPages, freshKeys.length, filterDisplayLabel(filter));
-          await btn.update({ embeds: [newEmbed], components: [paginationRow(page, newTotalPages, "keylist")] });
-        } finally {
-          busy = false;
-        }
+        const [, action] = btn.customId.split(":");
+        if      (action === "first") page = 0;
+        else if (action === "prev")  page = Math.max(0, page - 1);
+        else if (action === "next")  page = Math.min(totalPages - 1, page + 1);
+        else if (action === "last")  page = totalPages - 1;
+        const newEmbed = buildKeyListEmbed(allKeys, page, totalPages, total, label);
+        const newRow   = paginationRow(page, totalPages, prefix);
+        await btn.update({ embeds: [newEmbed], components: [newRow] });
       });
-
       collector.on("end", async () => {
-        await message.edit({ components: [] }).catch(() => {});
+        try { await interaction.editReply({ components: [] }); } catch { /* ignore */ }
       });
-    }
 
-    // ── /suakey ──────────────────────────────────────────────────────────────
-    else if (cmd === "suakey") {
-      const keyStr = interaction.options.getString("key", true);
-      const label  = interaction.options.getString("nhan");
-      const note   = interaction.options.getString("ghichu");
-      const maxDev = interaction.options.getInteger("thietbi");
+    // ── /suakey ───────────────────────────────────────────────────────────────
+    } else if (cmd === "suakey") {
+      const keyStr  = interaction.options.getString("key", true).trim().toUpperCase();
+      const nhan    = interaction.options.getString("nhan");
+      const ghichu  = interaction.options.getString("ghichu");
+      const thietbi = interaction.options.getInteger("thietbi");
 
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-
-      if (label === null && note === null && maxDev === null) {
-        await interaction.editReply("⚠️ Cần cung cấp ít nhất một trong: nhãn, ghichú, thietbi.");
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      if (!nhan && !ghichu && thietbi == null) {
+        await interaction.editReply("❌ Phải chỉ định ít nhất một trường cần sửa (--nhan, --ghichu, --thietbi).");
         return;
       }
 
-      const patch: Partial<typeof keysTable.$inferInsert> = {};
-      if (label !== null) patch.label = label;
-      if (note !== null) patch.note = note;
-      if (maxDev !== null) patch.maxDevices = maxDev;
+      const patch: Partial<{ label: string; note: string; maxDevices: number }> = {};
+      if (nhan    != null) patch.label      = nhan;
+      if (ghichu  != null) patch.note       = ghichu;
+      if (thietbi != null) patch.maxDevices = thietbi;
 
-      const [updated] = await db.update(keysTable).set(patch).where(eq(keysTable.id, record.id)).returning();
-
+      await db.update(keysTable).set(patch).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
-        .setColor(0x00bcd4)
-        .setTitle("✏️ Đã cập nhật key")
+        .setColor(0x2196f3)
+        .setTitle("✅ Đã cập nhật key")
         .addFields(
-          { name: "🔑 Key",      value: `\`${updated.key}\``,      inline: false },
-          { name: "📛 Nhãn",     value: updated.label || "—",       inline: true  },
-          { name: "📱 Thiết bị", value: `${updated.maxDevices}`,    inline: true  },
-          { name: "📝 Ghi chú",  value: updated.note || "—",        inline: false },
-        )
-        .setTimestamp();
+          { name: "🗝️ Key",          value: `\`${keyStr}\``,                         inline: false },
+          { name: "🏷️ Nhãn",          value: patch.label      ?? record.label ?? "—", inline: true  },
+          { name: "📝 Ghi chú",       value: patch.note       ?? record.note  ?? "—", inline: true  },
+          { name: "📱 Max thiết bị",  value: String(patch.maxDevices ?? record.maxDevices),          inline: true  },
+        ).setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /khoakey ─────────────────────────────────────────────────────────────
-    else if (cmd === "khoakey") {
-      const keyStr = interaction.options.getString("key", true);
+    } else if (cmd === "khoakey") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-      if (!record.isActive) { await interaction.editReply("⚠️ Key đã bị khóa rồi."); return; }
-
-      await db.update(keysTable).set({ isActive: false }).where(eq(keysTable.id, record.id));
-
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      await db.update(keysTable).set({ isActive: false }).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
-        .setColor(0xff1744)
+        .setColor(0xff5252)
         .setTitle("🔒 Đã khóa key")
-        .setDescription(`Key \`${record.key}\` đã bị khóa.\n\nNgười dùng đang dùng key này sẽ bị đăng xuất **trong vòng 2 phút**.`)
+        .addFields({ name: "🗝️ Key", value: `\`${keyStr}\``, inline: false })
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /mokey ───────────────────────────────────────────────────────────────
-    else if (cmd === "mokey") {
-      const keyStr = interaction.options.getString("key", true);
+    } else if (cmd === "mokey") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-      if (record.isActive) { await interaction.editReply("⚠️ Key đang hoạt động rồi."); return; }
-
-      await db.update(keysTable).set({ isActive: true }).where(eq(keysTable.id, record.id));
-
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      await db.update(keysTable).set({ isActive: true }).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
         .setColor(0x00e676)
         .setTitle("🔓 Đã mở khóa key")
-        .addFields({ name: "🔑 Key", value: `\`${record.key}\``, inline: false })
+        .addFields({ name: "🗝️ Key", value: `\`${keyStr}\``, inline: false })
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
-    // ── /xoakey ──────────────────────────────────────────────────────────────
-    else if (cmd === "xoakey") {
-      const keyStr = interaction.options.getString("key", true);
+    // ── /xoakey ───────────────────────────────────────────────────────────────
+    } else if (cmd === "xoakey") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-
-      await db.delete(keysTable).where(eq(keysTable.id, record.id));
-
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      // Xóa device liên quan trước
+      await db.delete(devicesTable).where(eq(devicesTable.key, keyStr));
+      await db.delete(keysTable).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
-        .setColor(0xff6d00)
-        .setTitle("🗑️ Đã xóa key")
-        .addFields({ name: "🔑 Key", value: `\`${record.key}\``, inline: false })
+        .setColor(0xf44336)
+        .setTitle("🗑️ Đã xóa key vĩnh viễn")
+        .addFields({ name: "🗝️ Key", value: `\`${keyStr}\``, inline: false })
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
-    // ── /giahan ──────────────────────────────────────────────────────────────
-    else if (cmd === "giahan") {
-      const keyStr = interaction.options.getString("key", true);
+    // ── /giahan ───────────────────────────────────────────────────────────────
+    } else if (cmd === "giahan") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const days   = interaction.options.getInteger("ngay", true);
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
 
-      const base = record.expiresAt && record.expiresAt > new Date() ? record.expiresAt : new Date();
+      const base     = record.expiresAt && record.expiresAt > new Date() ? record.expiresAt : new Date();
       const newExpiry = new Date(base.getTime() + days * 86400000);
-      await db.update(keysTable).set({ expiresAt: newExpiry }).where(eq(keysTable.id, record.id));
-
+      await db.update(keysTable).set({ expiresAt: newExpiry }).where(eq(keysTable.key, keyStr));
       const embed = new EmbedBuilder()
-        .setColor(0x00bcd4)
+        .setColor(0x00bfa5)
         .setTitle("📅 Đã gia hạn key")
         .addFields(
-          { name: "🔑 Key",        value: `\`${record.key}\``,    inline: false },
-          { name: "➕ Thêm",        value: `${days} ngày`,         inline: true  },
-          { name: "📅 Hết hạn mới", value: formatDate(newExpiry),  inline: true  },
-        )
-        .setTimestamp();
+          { name: "🗝️ Key",     value: `\`${keyStr}\``,      inline: false },
+          { name: "➕ Thêm",    value: `${days} ngày`,         inline: true  },
+          { name: "📅 Mới hết hạn", value: formatDate(newExpiry), inline: true },
+        ).setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /thietbi ─────────────────────────────────────────────────────────────
-    else if (cmd === "thietbi") {
-      const keyStr = interaction.options.getString("key", true);
+    } else if (cmd === "thietbi") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-
-      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
-      if (devices.length === 0) {
-        await interaction.editReply(`📱 Key \`${record.key}\` chưa có thiết bị nào.`);
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      const devs = await db.select().from(devicesTable)
+        .where(and(eq(devicesTable.key, keyStr), eq(devicesTable.isDeleted, false)));
+      if (devs.length === 0) {
+        await interaction.editReply(`📭 Key \`${keyStr}\` chưa có thiết bị nào đăng nhập.`);
         return;
       }
-
-      const lines = devices.map((d, i) => {
-        const ago = Math.floor((Date.now() - d.lastSeen.getTime()) / 1000);
-        const agoStr = ago < 60 ? `${ago}s trước` : ago < 3600 ? `${Math.floor(ago/60)}p trước` : `${Math.floor(ago/3600)}h trước`;
-        return `${i + 1}. 📱 **${d.deviceName}** | ID: \`${d.deviceId.substring(0, 8)}...\` | ${agoStr}`;
-      });
-
+      const lines = devs.map((d, i) =>
+        `**${i + 1}.** 📱 ${d.deviceName} · \`${d.deviceId.slice(0, 16)}…\` · Lần cuối: ${formatDate(d.lastSeen)}`
+      );
       const embed = new EmbedBuilder()
         .setColor(0x7c4dff)
-        .setTitle(`📱 Thiết bị của key \`${record.key}\``)
+        .setTitle(`📱 Thiết bị của key \`${keyStr}\``)
         .setDescription(lines.join("\n"))
-        .setFooter({ text: `${devices.length}/${record.maxDevices} thiết bị` })
+        .setFooter({ text: "Dùng /xoathietbi <key> <stt> để xóa" })
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
-    // ── /xoathietbi ──────────────────────────────────────────────────────────
-    else if (cmd === "xoathietbi") {
-      const keyStr = interaction.options.getString("key", true);
+    // ── /xoathietbi ─────────────────────────────────────────────────────────
+    } else if (cmd === "xoathietbi") {
+      const keyStr = interaction.options.getString("key", true).trim().toUpperCase();
       const stt    = interaction.options.getInteger("stt", true);
       const record = await findKey(keyStr);
-      if (!record) { await interaction.editReply("❌ Không tìm thấy key."); return; }
-
-      const devices = await db.select().from(devicesTable).where(eq(devicesTable.keyId, record.id));
-      const target  = devices[stt - 1];
-      if (!target) { await interaction.editReply(`❌ Không có thiết bị số ${stt}.`); return; }
-
-      await db.delete(devicesTable).where(eq(devicesTable.id, target.id));
-
-      await interaction.editReply(`✅ Đã xóa thiết bị **${target.deviceName}** khỏi key \`${record.key}\`.`);
-    }
+      if (!record) { await interaction.editReply(`❌ Không tìm thấy key \`${keyStr}\`.`); return; }
+      const devs = await db.select().from(devicesTable)
+        .where(and(eq(devicesTable.key, keyStr), eq(devicesTable.isDeleted, false)));
+      const idx  = stt - 1;
+      if (idx < 0 || idx >= devs.length) {
+        await interaction.editReply(`❌ STT ${stt} không hợp lệ (key có ${devs.length} thiết bị).`);
+        return;
+      }
+      const target = devs[idx];
+      await db.update(devicesTable)
+        .set({ isDeleted: true })
+        .where(eq(devicesTable.id, target.id));
+      const embed = new EmbedBuilder()
+        .setColor(0xff9800)
+        .setTitle("🗑️ Đã xóa thiết bị")
+        .addFields(
+          { name: "🗝️ Key",    value: `\`${keyStr}\``,      inline: false },
+          { name: "📱 Device", value: target.deviceName,     inline: true  },
+          { name: "🆔 ID",     value: `\`${target.deviceId.slice(0, 16)}…\``, inline: true },
+        ).setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
 
     // ── /thongke ─────────────────────────────────────────────────────────────
-    else if (cmd === "thongke") {
-      const [{ total }]   = await db.select({ total: sql<number>`count(*)` }).from(keysTable);
-      const [{ active }]  = await db.select({ active: sql<number>`count(*)` }).from(keysTable).where(eq(keysTable.isActive, true));
-      const [{ devices }] = await db.select({ devices: sql<number>`count(*)` }).from(devicesTable);
-      const [{ vip }]     = await db.select({ vip: sql<number>`count(*)` }).from(keysTable).where(and(eq(keysTable.isActive, true), eq(keysTable.tier, "vip")));
-      const [{ notifs }]  = await db.select({ notifs: sql<number>`count(*)` }).from(notificationsTable);
-
-      const now = new Date();
-      const expiredKeys = await db.select().from(keysTable).where(
-        and(eq(keysTable.isActive, true), sql`${keysTable.expiresAt} < ${now}`)
-      );
-
+    } else if (cmd === "thongke") {
+      const [allKeys, allDevs] = await Promise.all([
+        db.select().from(keysTable),
+        db.select().from(devicesTable).where(eq(devicesTable.isDeleted, false)),
+      ]);
+      const now     = new Date();
+      const active  = allKeys.filter(k => k.isActive && !(k.expiresAt && k.expiresAt < now));
+      const expired = allKeys.filter(k => k.expiresAt && k.expiresAt < now);
+      const locked  = allKeys.filter(k => !k.isActive);
+      const vip     = allKeys.filter(k => k.tier === "vip");
+      const free    = allKeys.filter(k => k.tier === "free");
       const embed = new EmbedBuilder()
         .setColor(0x7c4dff)
         .setTitle("📊 Thống kê hệ thống")
         .addFields(
-          { name: "🗝️ Tổng key",    value: `${Number(total)}`,            inline: true },
-          { name: "✅ Đang hoạt động", value: `${Number(active)}`,         inline: true },
-          { name: "⛔ Hết hạn",      value: `${expiredKeys.length}`,       inline: true },
-          { name: "👑 VIP",          value: `${Number(vip)}`,              inline: true },
-          { name: "🆓 FREE",         value: `${Number(active) - Number(vip)}`, inline: true },
-          { name: "📱 Thiết bị",     value: `${Number(devices)}`,          inline: true },
-          { name: "📢 Thông báo",    value: `${Number(notifs)}`,           inline: true },
-        )
-        .setTimestamp();
+          { name: "🗝️ Tổng key",        value: `${allKeys.length}`,  inline: true },
+          { name: "✅ Đang hoạt động",   value: `${active.length}`,   inline: true },
+          { name: "⛔ Hết hạn",          value: `${expired.length}`,  inline: true },
+          { name: "🔒 Đã khóa",          value: `${locked.length}`,   inline: true },
+          { name: "👑 VIP",              value: `${vip.length}`,      inline: true },
+          { name: "🆓 FREE",             value: `${free.length}`,     inline: true },
+          { name: "📱 Tổng thiết bị",   value: `${allDevs.length}`,  inline: true },
+        ).setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /online ──────────────────────────────────────────────────────────────
-    else if (cmd === "online") {
-      const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-      const onlineDevices = await db.select().from(devicesTable)
-        .where(sql`${devicesTable.lastSeen} > ${fiveMinAgo}`);
-
-      if (onlineDevices.length === 0) {
-        await interaction.editReply("😴 Không có thiết bị nào online trong 5 phút gần nhất.");
+    } else if (cmd === "online") {
+      const result = await db.execute(
+        sql`SELECT device_id, device_name, "key", tier, device_os, device_sdk, device_ram, last_seen
+            FROM devices
+            WHERE is_deleted = false
+              AND last_seen > NOW() - INTERVAL '5 minutes'
+            ORDER BY last_seen DESC
+            LIMIT 30`
+      );
+      const rows = (result as any).rows ?? [];
+      if (rows.length === 0) {
+        await interaction.editReply("📭 Không có thiết bị nào online trong 5 phút gần nhất.");
         return;
       }
-
-      const lines = await Promise.all(onlineDevices.map(async d => {
-        const [k] = await db.select().from(keysTable).where(eq(keysTable.id, d.keyId));
-        const ago = Math.floor((Date.now() - d.lastSeen.getTime()) / 1000);
-        const badge = k?.tier === "vip" ? "👑" : "🆓";
-        return `🟢 ${badge} **${d.deviceName}** | Key: \`${k?.key ?? "?"}\` | ${ago < 60 ? `${ago}s` : `${Math.floor(ago / 60)}p`} trước`;
-      }));
-
+      const lines = rows.map((r: any, i: number) => {
+        const diffMs  = Date.now() - new Date(r.last_seen).getTime();
+        const diffMin = Math.floor(diffMs / 60_000);
+        const ago     = diffMin === 0 ? "vừa xong" : `${diffMin} phút trước`;
+        const osStr   = r.device_os ? ` · ${r.device_os}${r.device_sdk ? ` SDK${r.device_sdk}` : ""}` : "";
+        const ramStr  = r.device_ram ? ` · 💾 ${r.device_ram}` : "";
+        return `**${i + 1}.** 📱 ${r.device_name}${osStr}${ramStr}\n🗝️ \`${r.key}\` · ${tierBadge(r.tier)} · 🕒 ${ago}`;
+      });
       const embed = new EmbedBuilder()
-        .setColor(0x00e676)
-        .setTitle(`🟢 Thiết bị đang online (${onlineDevices.length})`)
-        .setDescription(lines.join("\n"))
+        .setColor(0x00bfa5)
+        .setTitle(`🟢 Thiết bị online (${rows.length})`)
+        .setDescription(lines.join("\n\n"))
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /thongbao ─────────────────────────────────────────────────────────────
-    else if (cmd === "thongbao") {
-      const title = interaction.options.getString("tieude", true);
-      const body  = interaction.options.getString("noidung", true);
-
-      const [notif] = await db.insert(notificationsTable).values({
-        title,
-        body,
-        sentBy: interaction.user.tag,
-      }).returning();
-
+    } else if (cmd === "thongbao") {
+      const title  = interaction.options.getString("tieude", true);
+      const body   = interaction.options.getString("noidung", true);
+      const sentBy = interaction.user.username;
+      const [record] = await db.insert(notificationsTable).values({ title, body, sentBy }).returning();
       const embed = new EmbedBuilder()
         .setColor(0xff9800)
         .setTitle("📢 Đã gửi thông báo")
-        .setDescription("Thông báo sẽ hiển thị với **tất cả người dùng** khi họ mở app hoặc trong lần heartbeat tiếp theo (≤2 phút).")
         .addFields(
-          { name: "📌 Tiêu đề",  value: title, inline: false },
+          { name: "📌 Tiêu đề", value: title,  inline: false },
           { name: "📝 Nội dung", value: body,  inline: false },
-        )
-        .setFooter({ text: `ID: ${notif.id} · Bởi: ${interaction.user.tag}` })
-        .setTimestamp();
+          { name: "🆔 ID",       value: `#${record.id}`, inline: true },
+          { name: "👤 Gửi bởi", value: sentBy, inline: true },
+        ).setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
-    // ── /danhsachthongbao ────────────────────────────────────────────────────
-    else if (cmd === "danhsachthongbao") {
-      const notifs = await db.select().from(notificationsTable).orderBy(sql`${notificationsTable.createdAt} DESC`);
-
-      if (notifs.length === 0) {
-        await interaction.editReply("📭 Chưa có thông báo nào.");
-        return;
-      }
-
-      let totalPages = Math.max(1, Math.ceil(notifs.length / PAGE_SIZE));
+    // ── /danhsachthongbao ─────────────────────────────────────────────────────
+    } else if (cmd === "danhsachthongbao") {
+      const allNotifs = await db.select().from(notificationsTable).orderBy(notificationsTable.createdAt);
+      const total = allNotifs.length;
+      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
       let page = 0;
-
-      const embed = buildNotifListEmbed(notifs, page, totalPages, notifs.length);
-      const components = totalPages > 1 ? [paginationRow(page, totalPages, "notiflist")] : [];
-
-      const message = await interaction.editReply({ embeds: [embed], components });
-      if (totalPages <= 1) return;
-
-      const collector = message.createMessageComponentCollector({
-        componentType: ComponentType.Button,
-        time: 5 * 60 * 1000,
-      });
-
-      let busy = false;
-      collector.on("collect", async (btn: ButtonInteraction) => {
-        if (btn.user.id !== interaction.user.id) {
-          await btn.reply({ content: "❌ Bạn không thể điều khiển danh sách này.", flags: 64 });
-          return;
-        }
-        if (busy) {
-          await btn.deferUpdate().catch(() => {});
-          return;
-        }
-        busy = true;
-        try {
-          const [, action] = btn.customId.split(":");
-          if (action === "first") page = 0;
-          else if (action === "prev") page = Math.max(0, page - 1);
-          else if (action === "next") page = Math.min(totalPages - 1, page + 1);
-          else if (action === "last") page = totalPages - 1;
-
-          const freshNotifs = await db.select().from(notificationsTable).orderBy(sql`${notificationsTable.createdAt} DESC`);
-          const newTotalPages = Math.max(1, Math.ceil(freshNotifs.length / PAGE_SIZE));
-          page = Math.min(page, newTotalPages - 1);
-          totalPages = newTotalPages;
-
-          const newEmbed = buildNotifListEmbed(freshNotifs, page, newTotalPages, freshNotifs.length);
-          await btn.update({ embeds: [newEmbed], components: [paginationRow(page, newTotalPages, "notiflist")] });
-        } finally {
-          busy = false;
-        }
-      });
-
-      collector.on("end", async () => {
-        await message.edit({ components: [] }).catch(() => {});
-      });
-    }
-
-    // ── /xoathongbao ─────────────────────────────────────────────────────────
-    else if (cmd === "xoathongbao") {
-      const id = interaction.options.getInteger("id", true);
-      const [existing] = await db.select().from(notificationsTable).where(eq(notificationsTable.id, id));
-      if (!existing) { await interaction.editReply(`❌ Không tìm thấy thông báo #${id}.`); return; }
-
-      await db.delete(notificationsTable).where(eq(notificationsTable.id, id));
-      await db.delete(notificationReadsTable).where(eq(notificationReadsTable.notificationId, id));
-
-      const embed = new EmbedBuilder()
-        .setColor(0xff6d00)
-        .setTitle("🗑️ Đã xóa thông báo")
-        .addFields(
-          { name: "🆔 ID",       value: `#${existing.id}`,   inline: true  },
-          { name: "📌 Tiêu đề",  value: existing.title,      inline: true  },
-        )
-        .setTimestamp();
-      await interaction.editReply({ embeds: [embed] });
-    }
-
-    // ── /xoatatthongbao ──────────────────────────────────────────────────────
-    else if (cmd === "xoatatthongbao") {
-      const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(notificationsTable);
-      if (Number(count) === 0) {
-        await interaction.editReply("📭 Không có thông báo nào để xóa.");
+      const embed = buildNotifListEmbed(allNotifs, page, totalPages, total);
+      if (totalPages <= 1) {
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
-
-      await db.delete(notificationReadsTable);
-      await db.delete(notificationsTable);
-
-      const embed = new EmbedBuilder()
-        .setColor(0xff1744)
-        .setTitle("🗑️ Đã xóa tất cả thông báo")
-        .setDescription(`Đã xóa **${Number(count)}** thông báo.`)
-        .setTimestamp();
-      await interaction.editReply({ embeds: [embed] });
-    }
-
-    // ── /xoatatkey ───────────────────────────────────────────────────────────
-    else if (cmd === "xoatatkey") {
-      const filter = interaction.options.getString("loc") ?? "all";
-
-      // Label cho từng loại
-      const filterLabel: Record<string, string> = {
-        all:     "TẤT CẢ key",
-        free:    "tất cả key **FREE**",
-        expired: "tất cả key **đã hết hạn**",
-        locked:  "tất cả key **đã khóa**",
-      };
-
-      // Đếm số key sẽ bị xóa
-      const all = await db.select().from(keysTable);
-      const now = new Date();
-      let targets: typeof all;
-      switch (filter) {
-        case "free":    targets = all.filter(k => k.tier === "free");                                         break;
-        case "expired": targets = all.filter(k => k.isActive && k.expiresAt && k.expiresAt < now);           break;
-        case "locked":  targets = all.filter(k => !k.isActive);                                               break;
-        default:        targets = all;
-      }
-
-      if (targets.length === 0) {
-        await interaction.editReply(`📭 Không có key nào thuộc nhóm **${filterLabel[filter] ?? filter}** để xóa.`);
-        return;
-      }
-
-      // Hiển thị cảnh báo + nút xác nhận
-      const confirmEmbed = new EmbedBuilder()
-        .setColor(0xff1744)
-        .setTitle("⚠️  XÁC NHẬN XÓA HÀNG LOẠT KEY")
-        .setDescription(
-          `Bạn sắp xóa **${targets.length}** ${filterLabel[filter] ?? filter}.\n\n` +
-          `> ❌ Hành động này **KHÔNG THỂ HOÀN TÁC**.\n` +
-          `> Tất cả thiết bị liên kết với các key này cũng sẽ bị xóa.\n\n` +
-          `Nhấn **✅ Xác nhận** để tiếp tục, hoặc **❌ Hủy** để thoát.`,
-        )
-        .addFields({ name: "🔢 Số key sẽ xóa", value: `${targets.length}`, inline: true })
-        .setFooter({ text: "Lệnh hết hạn sau 30 giây nếu không có phản hồi" })
-        .setTimestamp();
-
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId("xoatatkey:confirm")
-          .setLabel("✅  Xác nhận xóa")
-          .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-          .setCustomId("xoatatkey:cancel")
-          .setLabel("❌  Hủy")
-          .setStyle(ButtonStyle.Secondary),
-      );
-
-      const msg = await interaction.editReply({ embeds: [confirmEmbed], components: [row] });
-
-      // Đợi người dùng bấm nút (30 giây)
+      const prefix = `notiflist:${Date.now()}`;
+      const row    = paginationRow(page, totalPages, prefix);
+      const msg    = await interaction.editReply({ embeds: [embed], components: [row] });
       const collector = msg.createMessageComponentCollector({
         componentType: ComponentType.Button,
+        filter: (btn: ButtonInteraction) => btn.user.id === interaction.user.id && btn.customId.startsWith(prefix),
+        time: 5 * 60_000,
+      });
+      collector.on("collect", async (btn: ButtonInteraction) => {
+        const [, action] = btn.customId.split(":");
+        if      (action === "first") page = 0;
+        else if (action === "prev")  page = Math.max(0, page - 1);
+        else if (action === "next")  page = Math.min(totalPages - 1, page + 1);
+        else if (action === "last")  page = totalPages - 1;
+        const newEmbed = buildNotifListEmbed(allNotifs, page, totalPages, total);
+        await btn.update({ embeds: [newEmbed], components: [paginationRow(page, totalPages, prefix)] });
+      });
+      collector.on("end", async () => {
+        try { await interaction.editReply({ components: [] }); } catch { /* ignore */ }
+      });
+
+    // ── /xoathongbao ─────────────────────────────────────────────────────────
+    } else if (cmd === "xoathongbao") {
+      const id = interaction.options.getInteger("id", true);
+      const [notif] = await db.select().from(notificationsTable).where(eq(notificationsTable.id, id));
+      if (!notif) {
+        await interaction.editReply(`❌ Không tìm thấy thông báo #${id}.`);
+        return;
+      }
+      await db.delete(notificationReadsTable).where(eq(notificationReadsTable.notificationId, id));
+      await db.delete(notificationsTable).where(eq(notificationsTable.id, id));
+      const embed = new EmbedBuilder()
+        .setColor(0xf44336)
+        .setTitle("🗑️ Đã xóa thông báo")
+        .addFields(
+          { name: "🆔 ID",       value: `#${id}`,     inline: true  },
+          { name: "📌 Tiêu đề", value: notif.title,   inline: false },
+        ).setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+
+    // ── /xoatatthongbao ───────────────────────────────────────────────────────
+    } else if (cmd === "xoatatthongbao") {
+      const allNotifs = await db.select().from(notificationsTable);
+      const count = allNotifs.length;
+      if (count === 0) {
+        await interaction.editReply("📭 Chưa có thông báo nào để xóa.");
+        return;
+      }
+      await db.delete(notificationReadsTable);
+      await db.delete(notificationsTable);
+      const embed = new EmbedBuilder()
+        .setColor(0xf44336)
+        .setTitle("🗑️ Đã xóa tất cả thông báo")
+        .addFields({ name: "📊 Số lượng", value: `${count}`, inline: true })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+
+    // ── /xoatatkey ───────────────────────────────────────────────────────────
+    } else if (cmd === "xoatatkey") {
+      const filter = interaction.options.getString("loc") ?? "all";
+      let allKeys = await fetchKeysForFilter(filter);
+      const count = allKeys.length;
+
+      if (count === 0) {
+        await interaction.editReply("📭 Không có key nào phù hợp để xóa.");
+        return;
+      }
+
+      // Xác nhận bằng buttons
+      const confirmRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId("bulk_confirm").setLabel(`⚠️ Xóa ${count} key`).setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("bulk_cancel").setLabel("Hủy").setStyle(ButtonStyle.Secondary),
+      );
+      const msg = await interaction.editReply({
+        content: `⚠️ **Xác nhận xóa ${count} key** (${filterDisplayLabel(filter)})?\nHành động này **không thể hoàn tác**.`,
+        components: [confirmRow],
+      });
+
+      const collector = msg.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        filter: (btn: ButtonInteraction) => btn.user.id === interaction.user.id,
         time: 30_000,
         max: 1,
       });
-
       collector.on("collect", async (btn: ButtonInteraction) => {
-        if (btn.user.id !== interaction.user.id) {
-          await btn.reply({ content: "❌ Bạn không thể xác nhận lệnh này.", flags: 64 });
-          return;
-        }
-
-        if (btn.customId === "xoatatkey:cancel") {
-          const cancelEmbed = new EmbedBuilder()
-            .setColor(0x607d8b)
-            .setTitle("↩️ Đã hủy")
-            .setDescription("Không có key nào bị xóa.")
-            .setTimestamp();
-          await btn.update({ embeds: [cancelEmbed], components: [] });
-          return;
-        }
-
-        // Xác nhận — thực hiện xóa
-        await btn.deferUpdate();
-
-        const targetIds = targets.map(k => k.id);
-
-        // Xóa thiết bị liên kết trước, sau đó xóa key
-        let deletedDevices = 0;
-        for (const id of targetIds) {
-          const devs = await db.delete(devicesTable).where(eq(devicesTable.keyId, id)).returning();
-          deletedDevices += devs.length;
-        }
-        for (const id of targetIds) {
-          await db.delete(keysTable).where(eq(keysTable.id, id));
-        }
-
-        const doneEmbed = new EmbedBuilder()
-          .setColor(0xff1744)
-          .setTitle("🗑️ Xóa hàng loạt hoàn tất")
-          .setDescription(`Đã xóa **${targets.length}** ${filterLabel[filter] ?? filter}.`)
-          .addFields(
-            { name: "🗝️ Key đã xóa",       value: `${targets.length}`,  inline: true },
-            { name: "📱 Thiết bị đã xóa",   value: `${deletedDevices}`,  inline: true },
-          )
-          .setFooter({ text: `Thực hiện bởi ${interaction.user.tag}` })
-          .setTimestamp();
-
-        await interaction.editReply({ embeds: [doneEmbed], components: [] });
-      });
-
-      collector.on("end", async (collected) => {
-        if (collected.size === 0) {
-          // Hết thời gian, vô hiệu hóa nút
-          const timeoutEmbed = new EmbedBuilder()
-            .setColor(0x607d8b)
-            .setTitle("⏰ Hết thời gian xác nhận")
-            .setDescription("Lệnh đã bị hủy do không có phản hồi trong 30 giây.")
-            .setTimestamp();
-          await interaction.editReply({ embeds: [timeoutEmbed], components: [] }).catch(() => {});
+        if (btn.customId === "bulk_confirm") {
+          const ids = allKeys.map(k => k.key);
+          await db.delete(devicesTable).where(inArray(devicesTable.key, ids));
+          await db.delete(keysTable).where(inArray(keysTable.key, ids));
+          await btn.update({ content: `✅ Đã xóa **${count} key** thành công.`, components: [] });
+        } else {
+          await btn.update({ content: "❌ Đã hủy.", components: [] });
         }
       });
-    }
+      collector.on("end", async (_, reason) => {
+        if (reason === "time") {
+          try { await interaction.editReply({ content: "⏱️ Hết thời gian xác nhận.", components: [] }); } catch { /* ignore */ }
+        }
+      });
 
     // ── /goyphan ─────────────────────────────────────────────────────────────
-    else if (cmd === "goyphan") {
-      const filter = interaction.options.getString("loai") ?? "all";
-
-      const all = await db.select().from(feedbacksTable).orderBy(feedbacksTable.createdAt);
-      const rows = filter === "all" ? all : all.filter(f => f.type === filter);
-
-      if (rows.length === 0) {
-        await interaction.editReply("📭 Chưa có phản hồi nào.");
+    } else if (cmd === "goyphan") {
+      const filterType = interaction.options.getString("loai") ?? "all";
+      let feedbacks = await db.select().from(feedbacksTable).orderBy(feedbacksTable.createdAt);
+      if (filterType !== "all") {
+        feedbacks = feedbacks.filter((f: typeof feedbacksTable.$inferSelect) => f.type === filterType);
+      }
+      if (feedbacks.length === 0) {
+        await interaction.editReply(`📭 Không có góp ý nào${filterType !== "all" ? ` loại \`${filterType}\`` : ""}.`);
         return;
       }
-
-      const typeIcon: Record<string, string> = { bug: "🐛", feedback: "⭐", contact: "💬" };
-      const lines = rows.slice(0, 20).map((f, i) => {
-        const stars = f.stars > 0 ? "⭐".repeat(f.stars) : "–";
-        const contact = f.contact ? ` · 📧 ${f.contact}` : "";
-        return `**${i + 1}. ${typeIcon[f.type] ?? "📩"} [${f.type.toUpperCase()}]** ${f.title}\n> ${f.message.slice(0, 120)}${f.message.length > 120 ? "…" : ""}\n> ${stars}${contact}`;
+      const typeLabel: Record<string, string> = { bug: "🐛 Báo lỗi", feedback: "💡 Góp ý", contact: "📞 Liên hệ" };
+      const lines = feedbacks.slice(0, 15).map((f: typeof feedbacksTable.$inferSelect, i: number) => {
+        const msg = f.message.length > 100 ? f.message.slice(0, 100) + "…" : f.message;
+        const stars = f.stars ? " · " + "⭐".repeat(f.stars) + `(${f.stars}/5)` : "";
+        return `**${i + 1}.** ${typeLabel[f.type] ?? f.type}${stars}\n📝 ${msg}\n📧 ${f.contact || "—"} · 🕒 ${formatDate(f.createdAt)}`;
       });
-
       const embed = new EmbedBuilder()
         .setColor(0x00e5ff)
-        .setTitle(`📋 Báo lỗi & Góp ý (${rows.length} mục)`)
+        .setTitle(`📩 Góp ý & Báo lỗi (${feedbacks.length})`)
         .setDescription(lines.join("\n\n"))
-        .setFooter({ text: `Hiển thị ${Math.min(20, rows.length)}/${rows.length} mục · Lọc: ${filter}` })
+        .setFooter({ text: "Hiển thị tối đa 15 mục gần nhất" })
         .setTimestamp();
-
       await interaction.editReply({ embeds: [embed] });
-    }
-
-    // ── /thongbaodaybp ───────────────────────────────────────────────────────
-    else if (cmd === "thongbaodaybp") {
-      const title = interaction.options.getString("tieude", true);
-      const body  = interaction.options.getString("noidung", true);
-
-      // Kiểm tra cấu hình FCM
-      if (!isFcmConfigured()) {
-        await interaction.editReply(
-          "⚠️ **FIREBASE_SERVICE_ACCOUNT_JSON** chưa được cấu hình trên server.\n" +
-          "Vào Firebase Console → Project settings → Service accounts → Generate new private key → đặt vào biến môi trường `FIREBASE_SERVICE_ACCOUNT_JSON`."
-        );
-        return;
-      }
-
-      // Lấy tất cả FCM token
-      const rows = await db.select({ fcmToken: fcmTokensTable.fcmToken }).from(fcmTokensTable);
-
-      if (rows.length === 0) {
-        await interaction.editReply(
-          "📭 Chưa có thiết bị nào đăng ký nhận push notification.\n" +
-          "Người dùng cần **cài app → đăng nhập key** để token được đăng ký tự động."
-        );
-        return;
-      }
-
-      const allTokens = rows.map(r => r.fcmToken);
-
-      // Gửi qua FCM v1 API
-      const result = await sendFcmPush(allTokens, title, body);
-
-      // Dọn token hết hạn khỏi DB
-      if (result.invalidTokens.length > 0) {
-        await db.delete(fcmTokensTable)
-          .where(inArray(fcmTokensTable.fcmToken, result.invalidTokens))
-          .catch(() => {});
-      }
-
-      const embed = new EmbedBuilder()
-        .setColor(result.sent > 0 ? 0x00e676 : 0xff5722)
-        .setTitle("📲 Push Notification Đã Gửi")
-        .addFields(
-          { name: "📌 Tiêu đề",          value: title,                    inline: false },
-          { name: "📝 Nội dung",          value: body,                     inline: false },
-          { name: "📱 Tổng thiết bị",     value: `${result.total}`,        inline: true  },
-          { name: "✅ Gửi thành công",    value: `${result.sent}`,         inline: true  },
-          { name: "❌ Thất bại",          value: `${result.failed}`,       inline: true  },
-          ...(result.invalidTokens.length > 0
-            ? [{ name: "🗑️ Token đã xóa", value: `${result.invalidTokens.length} token hết hạn`, inline: true }]
-            : []),
-          ...(result.error
-            ? [{ name: "⚠️ Lỗi", value: result.error, inline: false }]
-            : []),
-        )
-        .setFooter({ text: `Gửi bởi ${interaction.user.tag}` })
-        .setTimestamp();
-
-      await interaction.editReply({ embeds: [embed] });
-    }
-
 
     // ── /chatchapnhan ─────────────────────────────────────────────────────────
-    else if (cmd === "chatchapnhan") {
+    } else if (cmd === "chatchapnhan") {
       const sessionId = interaction.options.getInteger("id", true);
-      const adminUser = interaction.user;
-      const adminAvatar = adminUser.avatarURL({ size: 128 }) ?? "";
-      const adminName = adminUser.displayName || adminUser.username;
-
-      await db.execute(
-        sql`UPDATE chat_sessions SET status='accepted', admin_name=${adminName}, admin_avatar=${adminAvatar}, admin_online=true, updated_at=NOW() WHERE id=${sessionId}`
+      const result = await db.execute(
+        sql`UPDATE chat_sessions SET status = 'accepted', updated_at = NOW() WHERE id = ${sessionId} AND status = 'pending' RETURNING id, email, display_name`
       );
-      await db.execute(
-        sql`INSERT INTO chat_messages (session_id, sender, content, type) VALUES (${sessionId}, 'admin', ${"✅ Admin " + adminName + " đã chấp nhận trò chuyện! Xin chào bạn, tôi sẽ hỗ trợ bạn ngay."}, 'text')`
-      );
-
+      const rows = (result as any).rows ?? [];
+      if (rows.length === 0) {
+        await interaction.editReply(`❌ Không tìm thấy phiên chat #${sessionId} hoặc đã được chấp nhận rồi.`);
+        return;
+      }
+      const session = rows[0];
       const embed = new EmbedBuilder()
         .setColor(0x00e676)
-        .setTitle("✅ Đã chấp nhận phiên chat #" + sessionId)
-        .setDescription(`Admin **${adminName}** đã kết nối với người dùng. Dùng /chatra ${sessionId} <tin nhắn> để trả lời.`)
-        .setThumbnail(adminAvatar || null)
-        .setTimestamp();
+        .setTitle(`✅ Đã chấp nhận phiên chat #${sessionId}`)
+        .addFields(
+          { name: "📧 Email",   value: session.email,                 inline: true },
+          { name: "👤 Tên",     value: session.display_name || "—",   inline: true },
+          { name: "💡 Lệnh",    value: `/chatra ${sessionId} <tin nhắn>`, inline: false },
+        ).setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /chatra ───────────────────────────────────────────────────────────────
-    else if (cmd === "chatra") {
+    } else if (cmd === "chatra") {
       const sessionId = interaction.options.getInteger("id", true);
-      const message   = interaction.options.getString("tinhnhan", true);
-      const adminName = interaction.user.displayName || interaction.user.username;
-
+      const text      = interaction.options.getString("tinhnhan", true);
+      const result = await db.execute(
+        sql`SELECT id, status, device_id FROM chat_sessions WHERE id = ${sessionId}`
+      );
+      const session = ((result as any).rows ?? [])[0];
+      if (!session) {
+        await interaction.editReply(`❌ Không tìm thấy phiên chat #${sessionId}.`);
+        return;
+      }
+      if (session.status !== "accepted") {
+        await interaction.editReply(`❌ Phiên chat #${sessionId} chưa được chấp nhận. Dùng /chatchapnhan trước.`);
+        return;
+      }
       await db.execute(
-        sql`INSERT INTO chat_messages (session_id, sender, content, type) VALUES (${sessionId}, 'admin', ${message}, 'text')`
+        sql`INSERT INTO chat_messages (session_id, sender, content, type, created_at) VALUES (${sessionId}, 'admin', ${text}, 'text', NOW())`
       );
       await db.execute(
-        sql`UPDATE chat_sessions SET updated_at=NOW() WHERE id=${sessionId}`
+        sql`UPDATE chat_sessions SET updated_at = NOW() WHERE id = ${sessionId}`
       );
-
-      const embed = new EmbedBuilder()
-        .setColor(0x1a90ff)
-        .setTitle("💬 Đã gửi tin nhắn - Session #" + sessionId)
-        .addFields({ name: "👤 Admin", value: adminName, inline: true })
-        .addFields({ name: "📝 Nội dung", value: message, inline: false })
-        .setTimestamp();
-      await interaction.editReply({ embeds: [embed] });
-    }
+      await interaction.editReply(`✅ Đã gửi tin nhắn đến phiên chat #${sessionId}.`);
 
     // ── /chatguianh ───────────────────────────────────────────────────────────
-    else if (cmd === "chatguianh") {
+    } else if (cmd === "chatguianh") {
       const sessionId = interaction.options.getInteger("id", true);
-      const imageUrl  = interaction.options.getString("url", true);
-
+      const url       = interaction.options.getString("url", true);
+      const result = await db.execute(
+        sql`SELECT id, status FROM chat_sessions WHERE id = ${sessionId}`
+      );
+      const session = ((result as any).rows ?? [])[0];
+      if (!session) {
+        await interaction.editReply(`❌ Không tìm thấy phiên chat #${sessionId}.`);
+        return;
+      }
+      if (session.status !== "accepted") {
+        await interaction.editReply(`❌ Phiên chat #${sessionId} chưa được chấp nhận.`);
+        return;
+      }
       await db.execute(
-        sql`INSERT INTO chat_messages (session_id, sender, content, type, image_data) VALUES (${sessionId}, 'admin', '[Hình ảnh từ Admin]', 'image', ${imageUrl})`
+        sql`INSERT INTO chat_messages (session_id, sender, content, type, image_data, created_at) VALUES (${sessionId}, 'admin', '', 'image', ${url}, NOW())`
       );
       await db.execute(
-        sql`UPDATE chat_sessions SET updated_at=NOW() WHERE id=${sessionId}`
+        sql`UPDATE chat_sessions SET updated_at = NOW() WHERE id = ${sessionId}`
       );
+      await interaction.editReply(`✅ Đã gửi ảnh đến phiên chat #${sessionId}.`);
 
-      const embed = new EmbedBuilder()
-        .setColor(0x9c27b0)
-        .setTitle("🖼️ Đã gửi ảnh - Session #" + sessionId)
-        .setImage(imageUrl)
-        .setTimestamp();
-      await interaction.editReply({ embeds: [embed] });
-    }
-
-    // ── /chatthoat ────────────────────────────────────────────────────────────
-    else if (cmd === "chatthoat") {
+    // ── /chatthoat ─────────────────────────────────────────────────────────────
+    } else if (cmd === "chatthoat") {
       const sessionId = interaction.options.getInteger("id", true);
-
       await db.execute(
-        sql`INSERT INTO chat_messages (session_id, sender, content, type) VALUES (${sessionId}, 'bot', '❌ Admin đã kết thúc phiên trò chuyện. Cảm ơn bạn đã liên hệ! Nếu cần hỗ trợ thêm hãy bắt đầu cuộc trò chuyện mới.', 'text')`
-      );
-      await db.execute(
-        sql`UPDATE chat_sessions SET status='closed', admin_online=false, updated_at=NOW() WHERE id=${sessionId}`
+        sql`UPDATE chat_sessions SET status = 'closed', updated_at = NOW() WHERE id = ${sessionId}`
       );
 
       const embed = new EmbedBuilder()
@@ -1204,10 +1042,9 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
         .setDescription("Người dùng đã được thông báo phiên chat kết thúc.")
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
     // ── /chatdanhsach ─────────────────────────────────────────────────────────
-    else if (cmd === "chatdanhsach") {
+    } else if (cmd === "chatdanhsach") {
       const result = await db.execute(
         sql`SELECT id, device_id, email, display_name, status, created_at FROM chat_sessions WHERE status IN ('pending','accepted') ORDER BY updated_at DESC LIMIT 20`
       );
@@ -1231,8 +1068,146 @@ async function handleInteraction(interaction: ChatInputCommandInteraction) {
         .setFooter({ text: "Dùng /chatchapnhan <id> · /chatra <id> <msg> · /chatthoat <id>" })
         .setTimestamp();
       await interaction.editReply({ embeds: [embed] });
-    }
 
+    // ── /thongbaodaybp ────────────────────────────────────────────────────────
+    } else if (cmd === "thongbaodaybp") {
+      const title  = interaction.options.getString("tieude", true);
+      const body   = interaction.options.getString("noidung", true);
+
+      if (!isFcmConfigured()) {
+        await interaction.editReply("❌ FCM chưa được cấu hình. Thêm biến môi trường `FIREBASE_SERVICE_ACCOUNT_JSON`.");
+        return;
+      }
+
+      // Lấy tất cả FCM token
+      const tokens = await db.select().from(fcmTokensTable);
+      if (tokens.length === 0) {
+        await interaction.editReply("📭 Chưa có thiết bị nào đăng ký nhận push notification.");
+        return;
+      }
+
+      let successCount = 0;
+      let failCount = 0;
+      const batchSize = 500;
+
+      for (let i = 0; i < tokens.length; i += batchSize) {
+        const batch = tokens.slice(i, i + batchSize).map(t => t.token);
+        try {
+          const result = await sendFcmPush({ tokens: batch, title, body });
+          successCount += result.successCount ?? 0;
+          failCount    += result.failureCount ?? 0;
+        } catch (err) {
+          logger.error({ err }, "FCM batch push error");
+          failCount += batch.length;
+        }
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(successCount > 0 ? 0x00e676 : 0xff5252)
+        .setTitle("📲 Đã gửi push notification")
+        .addFields(
+          { name: "📌 Tiêu đề",  value: title,            inline: false },
+          { name: "📝 Nội dung", value: body,             inline: false },
+          { name: "✅ Thành công", value: `${successCount}`, inline: true },
+          { name: "❌ Thất bại",  value: `${failCount}`,    inline: true },
+          { name: "📱 Tổng",      value: `${tokens.length}`, inline: true },
+        ).setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+
+    // ════════════════════════════════════════════════════════════════════════
+    // FORCE UPDATE COMMANDS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── /update ───────────────────────────────────────────────────────────────
+    } else if (cmd === "update") {
+      const trangThai  = interaction.options.getString("trang_thai", true); // "on" | "off"
+      const phienBan   = interaction.options.getInteger("phien_ban");       // optional
+
+      const enabled = trangThai === "on";
+
+      // Đọc config hiện tại để giữ nguyên nếu không truyền phiên bản
+      const currentConfig = await getAppConfig();
+      const currentMinVer = parseInt(currentConfig["min_version_code"] ?? "0", 10);
+      const newMinVer     = phienBan != null ? phienBan : currentMinVer;
+
+      await Promise.all([
+        setAppConfig("force_update_enabled", enabled ? "true" : "false"),
+        setAppConfig("min_version_code", String(newMinVer)),
+      ]);
+
+      const downloadUrl = currentConfig["download_url"] ?? "";
+      const statusIcon  = enabled ? "🟢" : "🔴";
+      const statusText  = enabled ? "BẬT — người dùng bắt buộc cập nhật" : "TẮT — cho vào app bình thường";
+
+      const embed = new EmbedBuilder()
+        .setColor(enabled ? 0xff5722 : 0x00e676)
+        .setTitle(`${statusIcon} Force Update: ${enabled ? "ON" : "OFF"}`)
+        .addFields(
+          { name: "📌 Trạng thái",          value: statusText,                        inline: false },
+          { name: "🔢 VersionCode tối thiểu", value: `${newMinVer}`,                   inline: true  },
+          { name: "🔗 Link tải APK",          value: downloadUrl || "*(chưa đặt)*",    inline: false },
+        )
+        .setFooter({ text: "Dùng /setdownloadurl để đặt link tải APK · /statusupdate để xem trạng thái" })
+        .setTimestamp();
+
+      await interaction.editReply({ embeds: [embed] });
+
+    // ── /setdownloadurl ───────────────────────────────────────────────────────
+    } else if (cmd === "setdownloadurl") {
+      const url = interaction.options.getString("url", true).trim();
+
+      // Validate URL cơ bản
+      try {
+        new URL(url);
+      } catch {
+        await interaction.editReply("❌ URL không hợp lệ. Vui lòng nhập URL đúng định dạng (bắt đầu bằng https:// hoặc http://).");
+        return;
+      }
+
+      await setAppConfig("download_url", url);
+
+      const embed = new EmbedBuilder()
+        .setColor(0x2196f3)
+        .setTitle("🔗 Đã cập nhật link tải APK")
+        .addFields(
+          { name: "🔗 URL",         value: url,  inline: false },
+          { name: "💡 Hướng dẫn",   value: "Người dùng nhấn **[Cập nhật]** trong app sẽ được chuyển đến link này.", inline: false },
+        )
+        .setFooter({ text: "Dùng /update on để bật force update cho người dùng" })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+
+    // ── /statusupdate ─────────────────────────────────────────────────────────
+    } else if (cmd === "statusupdate") {
+      const config = await getAppConfig();
+
+      const forceEnabled  = config["force_update_enabled"] === "true";
+      const minVersionCode = config["min_version_code"] ?? "0";
+      const downloadUrl   = config["download_url"] ?? "";
+
+      const statusIcon = forceEnabled ? "🟢 BẬT" : "🔴 TẮT";
+
+      const embed = new EmbedBuilder()
+        .setColor(forceEnabled ? 0xff5722 : 0x4caf50)
+        .setTitle("📊 Trạng thái Force Update")
+        .addFields(
+          { name: "🔄 Force Update",           value: statusIcon,                      inline: true  },
+          { name: "🔢 VersionCode tối thiểu",  value: minVersionCode,                  inline: true  },
+          { name: "🔗 Link tải APK",            value: downloadUrl || "*(chưa đặt)*",   inline: false },
+        )
+        .addFields({
+          name: "📋 Hướng dẫn sử dụng",
+          value:
+            "`/update on [phien_ban]` — Bật force update\n" +
+            "`/update off` — Tắt force update\n" +
+            "`/setdownloadurl <url>` — Đặt link tải APK\n" +
+            "`/statusupdate` — Xem trạng thái này",
+          inline: false,
+        })
+        .setTimestamp();
+      await interaction.editReply({ embeds: [embed] });
+
+    }
 
   } catch (err) {
     logger.error({ err }, "Discord command error");
@@ -1274,7 +1249,7 @@ export async function startDiscordBot(): Promise<void> {
 // DISCORD LOG CHANNEL — gửi thông báo tự động về kênh server
 // ════════════════════════════════════════════════════════════════════════════
 
-const LOG_CHANNEL_ID = process.env.DISCORD_LOG_CHANNEL_ID ?? "";
+const LOG_CHANNEL_ID  = process.env.DISCORD_LOG_CHANNEL_ID  ?? "";
 const CHAT_CHANNEL_ID = process.env.DISCORD_CHAT_CHANNEL_ID ?? "";
 
 // Singleton REST client dùng riêng cho log channel (tách biệt với bot slash-command)
@@ -1327,7 +1302,7 @@ function _evMeta(ev: DiscordLogEvent): { color: number; icon: string; title: str
     case "KEY_EXPIRED_HB":   return { color: 0xFF5722, icon: "⛔", title: "Key Hết Hạn (Phát Hiện)" };
     case "KEY_REVOKED_HB":   return { color: 0xF44336, icon: "🔒", title: "Key Bị Thu Hồi (Phát Hiện)" };
     case "GOOGLE_LOGIN":     return { color: 0x4285F4, icon: "🔵", title: "Đăng Nhập Google" };
-    case "FEEDBACK":         return { color: 0x00E5FF, icon: "📩", title: "Phản Hồi Người Dùng" };
+    default:                 return { color: 0x00E5FF, icon: "📩", title: "Sự Kiện" };
   }
 }
 
