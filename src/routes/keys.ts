@@ -10,7 +10,7 @@ const router: IRouter = Router();
 
 const ADMIN_SECRET      = process.env.ADMIN_SECRET_KEY ?? "";
 const LINK4M_API_TOKEN = process.env.LINK4M_API_TOKEN ?? "";
-const API_BASE_URL      = process.env.API_BASE_URL ?? "https://aujunpeak-api.onrender.com";
+const API_BASE_URL      = process.env.API_BASE_URL ?? "http://103.140.249.74:3000";
 
 function requireAdmin(req: any, res: any, next: any): void {
   const secret = req.headers["x-admin-secret"];
