@@ -9,18 +9,18 @@
  * FCM v1 API gửi từng token một (không hỗ trợ registration_ids như Legacy).
  * Hàm sendFcmPush() xử lý tự động theo batch song song để tối ưu tốc độ.
  */
-
+import fs from "node:fs";
 import { logger } from "./logger.js";
 
 // ─── Đọc cấu hình từ env ─────────────────────────────────────────────────────
 
 function getServiceAccount(): Record<string, string> | null {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? "";
-  if (!raw) return null;
   try {
-    return JSON.parse(raw) as Record<string, string>;
-  } catch {
-    logger.error("FIREBASE_SERVICE_ACCOUNT_JSON không phải JSON hợp lệ");
+    return JSON.parse(
+      fs.readFileSync("./firebase-service-account.json", "utf8")
+    ) as Record<string, string>;
+  } catch (err) {
+    logger.error({ err }, "Không đọc được firebase-service-account.json");
     return null;
   }
 }
